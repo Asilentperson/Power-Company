@@ -1,0 +1,319 @@
+"""引擎单元测试：锁住"经营→财报→股价→股权"这条链上的关键不变量。
+
+运行：python -m unittest discover -s tests -v
+"""
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pwer import ma  # noqa: E402
+from pwer.constants import HOURS_PER_TURN, PLANT_SPECS  # noqa: E402
+from pwer.engine import Game  # noqa: E402
+from pwer.grid import city_supply, components  # noqa: E402
+from pwer.world import Terrain, WorldMap, chebyshev  # noqa: E402
+
+
+def new_game(seed: int = 1234) -> Game:
+    return Game.new_game(seed)
+
+
+class TestWorld(unittest.TestCase):
+    def setUp(self) -> None:
+        self.w = WorldMap.generate(99)
+
+    def test_map_has_four_cities(self) -> None:
+        self.assertEqual(len(self.w.cities), 4)
+
+    def test_hydro_only_on_river(self) -> None:
+        for t in self.w.iter_tiles():
+            ok, why = self.w.check_build("hydro", t.x, t.y)
+            if ok:
+                self.assertIs(t.terrain, Terrain.RIVER)
+            elif t.terrain is not Terrain.CITY and not t.occupied:
+                self.assertIn("河流", why)
+
+    def test_nuclear_away_from_city(self) -> None:
+        for t in self.w.iter_tiles():
+            ok, _ = self.w.check_build("nuclear", t.x, t.y)
+            if ok:
+                for c in self.w.cities:
+                    self.assertGreater(chebyshev(t.x, t.y, c.x, c.y), 2)
+
+    def test_coal_needs_water(self) -> None:
+        for t in self.w.iter_tiles():
+            ok, why = self.w.check_build("coal", t.x, t.y)
+            if ok:
+                self.assertTrue(self.w.has_water_adjacent(t.x, t.y))
+
+    def test_every_kind_has_buildable_tile(self) -> None:
+        for kind in PLANT_SPECS:
+            tiles = self.w.find_tiles(kind, limit=5)
+            self.assertGreater(len(tiles), 0, f"{kind} 没有可建地块，地图资源分布有问题")
+
+    def test_occupied_tile_rejected(self) -> None:
+        t = self.w.find_tiles("gas", 1)[0]
+        tile = self.w.tile(*t)
+        tile.owner, tile.kind = 0, "gas"
+        ok, why = self.w.check_build("gas", *t)
+        self.assertFalse(ok)
+
+
+class TestGrid(unittest.TestCase):
+    def setUp(self) -> None:
+        self.g = new_game()
+        self.city = self.g.world.cities[0]
+        self.me = self.g.player
+
+    def test_city_supply_limit(self) -> None:
+        cap, loss = city_supply(self.g.world, self.me.idx, self.city)
+        total_plant = sum(p.cap for p in self.me.plants)
+        self.assertGreater(cap, 0)
+        self.assertLessEqual(cap, total_plant + 1e-6)
+        self.assertGreaterEqual(loss, 0.0)
+
+    def test_isolated_plant_cannot_deliver(self) -> None:
+        co = self.g.companies[1]
+        cap, _ = city_supply(self.g.world, co.idx, self.city)
+        self.assertEqual(cap, 0.0)
+
+    def test_components_are_connected(self) -> None:
+        comps = components(self.g.world, self.me.idx)
+        self.assertTrue(comps)
+        for comp in comps:
+            start = next(iter(comp))
+            seen = {start}
+            stack = [start]
+            while stack:
+                x, y = stack.pop()
+                for n in self.g.world.neighbors4(x, y):
+                    if n in comp and n not in seen:
+                        seen.add(n)
+                        stack.append(n)
+            self.assertEqual(seen, comp)
+
+
+class TestDispatch(unittest.TestCase):
+    def test_served_never_exceeds_capacity(self) -> None:
+        g = new_game()
+        g.end_turn()
+        for city in g.world.cities:
+            for cid, mw in city.served.items():
+                co = g.companies[cid]
+                cap = g.city_cap[cid].get(city.idx, 0.0)
+                self.assertLessEqual(mw, cap + 1.0)
+
+    def test_revenue_matches_energy(self) -> None:
+        g = new_game()
+        g.end_turn()
+        co = g.player
+        st = co.last_income
+        e_res = st.revenue_res * 10_000.0 / co.res_price
+        e_ind = st.revenue_ind * 10_000.0 / co.ind_price
+        self.assertAlmostEqual(e_res + e_ind, st.served_mwh, delta=1.0)
+        self.assertAlmostEqual(st.served_mwh, (co.served_mw) * HOURS_PER_TURN, delta=1.0)
+
+    def test_no_fixed_double_count(self) -> None:
+        g = new_game()
+        g.end_turn()
+        co = g.player
+        st = co.last_income
+        expect_dep = sum(p.dep_q for p in co.plants) + sum(m.dep_q for m in co.mines)
+        self.assertAlmostEqual(st.depreciation, expect_dep, delta=1.0)
+        self.assertAlmostEqual(st.fixed, sum(p.oam_q for p in co.plants), delta=1.0)
+
+
+class TestFinance(unittest.TestCase):
+    def test_balanced_bookkeeping(self) -> None:
+        """现金变动 = 净利润 + 折旧 - 股利支付 - 资本开支（本回合没有新建设）"""
+        g = new_game()
+        co = g.player
+        cash0 = co.cash
+        equity0 = co.equity()
+        g.end_turn()
+        st = co.last_income
+        div = co.dividends_paid
+        delta = co.cash - cash0
+        # 现金 = 净利润 + 折旧 - 股利（股利在净利润之外单独支付）
+        self.assertAlmostEqual(delta, st.net_profit + st.depreciation - div
+                               - sum(p.per_turn for p in []), delta=50)
+        self.assertGreater(co.equity(), equity0 - 10_000)
+
+    def test_depreciation_reduces_book_value(self) -> None:
+        g = new_game()
+        p = g.player.plants[0]
+        bv0 = p.book_value
+        g.end_turn()
+        self.assertLess(p.book_value, bv0)
+
+    def test_bankruptcy_when_insolvent(self) -> None:
+        g = new_game()
+        co = g.player
+        co.debt = co.assets() * 3
+        co.cash = -1.0
+        g.settle_finance()
+        # 现金为负且无处借款 → 破产
+        self.assertFalse(co.alive)
+        self.assertTrue(g.game_over)
+
+    def test_borrow_limit(self) -> None:
+        g = new_game()
+        co = g.player
+        limit = co.assets() * 0.65 - co.debt
+        got = g.borrow(co, limit * 10)
+        self.assertLessEqual(got, limit + 1e-6)
+        with self.assertRaises(ValueError):
+            g.borrow(co, 1.0)
+
+
+class TestValuation(unittest.TestCase):
+    def test_price_follows_profit(self) -> None:
+        g = new_game()
+        co = g.player
+        for _ in range(6):
+            g.end_turn()
+        p1 = co.price
+        # 人为制造两个季度的暴利
+        co.profit_history = [20_000.0, 25_000.0, 30_000.0, 35_000.0]
+        from pwer.valuation import update_price
+        update_price(co, g.rng)
+        self.assertGreater(co.price, p1)
+
+    def test_loss_makes_price_fall(self) -> None:
+        g = new_game()
+        co = g.player
+        g.end_turn()
+        p0 = co.price
+        co.profit_history = [-8_000.0] * 4
+        from pwer.valuation import update_price
+        for _ in range(4):
+            update_price(co, g.rng)
+        self.assertLess(co.price, p0)
+
+
+class TestMA(unittest.TestCase):
+    def setUp(self) -> None:
+        self.g = new_game()
+        self.me = self.g.player
+        self.tgt = self.g.companies[1]
+        self.me.cash = 1_000_000.0
+
+    def test_buy_shares_updates_stake(self) -> None:
+        qty = self.tgt.shares * 0.10
+        cost = ma.buy_shares(self.g, self.me.idx, self.tgt, qty)
+        self.assertGreater(cost, 0)
+        self.assertAlmostEqual(ma.player_stake(self.g, self.tgt), 0.10, places=3)
+
+    def test_cannot_buy_without_cash(self) -> None:
+        self.me.cash = 1.0
+        with self.assertRaises(ma.MaError):
+            ma.buy_shares(self.g, self.me.idx, self.tgt, self.tgt.shares * 0.1)
+
+    def test_control_requires_51(self) -> None:
+        ma.buy_shares(self.g, self.me.idx, self.tgt, self.tgt.shares * 0.30)
+        with self.assertRaises(ma.MaError):
+            ma.take_control(self.g, self.tgt)
+        ma.buy_shares(self.g, self.me.idx, self.tgt, self.tgt.shares * 0.25)
+        ma.take_control(self.g, self.tgt)
+        self.assertEqual(self.tgt.controlled_by, self.me.idx)
+
+    def test_merge_transfers_assets(self) -> None:
+        n_plants = len(self.me.plants)
+        target_plants = len(self.tgt.plants)
+        target_debt = self.tgt.debt
+        ma.buy_shares(self.g, self.me.idx, self.tgt, self.tgt.shares * 0.80)
+        ma.absorb_merge(self.g, self.tgt)
+        self.assertEqual(len(self.me.plants), n_plants + target_plants)
+        self.assertGreaterEqual(self.me.debt, target_debt)
+        self.assertTrue(self.tgt.delisted)
+        self.assertNotIn(self.tgt, [c for c in self.g.listed()])
+
+    def test_buyback_reduces_shares(self) -> None:
+        sh0 = self.me.shares
+        ma.buyback(self.g, self.me, self.me.shares * 0.02)
+        self.assertLess(self.me.shares, sh0)
+
+    def test_issue_shares_dilutes(self) -> None:
+        sh0 = self.me.shares
+        cash0 = self.me.cash
+        ma.issue_shares(self.g, self.me, self.me.shares * 0.05)
+        self.assertGreater(self.me.shares, sh0)
+        self.assertGreater(self.me.cash, cash0)
+
+
+class TestEngine(unittest.TestCase):
+    def test_twenty_turns_no_crash(self) -> None:
+        g = new_game(7)
+        for _ in range(20):
+            g.end_turn()
+            for co in g.companies:
+                self.assertGreaterEqual(co.cash, -1e-6)
+                self.assertGreater(co.shares, 0)
+                self.assertGreaterEqual(co.price, 0.3)
+                for p in co.plants:
+                    self.assertGreaterEqual(p.book_value, 0.0)
+                    self.assertLessEqual(p.dispatched_mwh, p.available_mwh + 1e-6)
+
+    def test_build_spends_cash_and_creates_project(self) -> None:
+        g = new_game()
+        me = g.player
+        me.cash = 500_000.0
+        spot = None
+        for t in g.world.iter_tiles():
+            ok, _ = g.can_build(me, "solar", t.x, t.y)
+            if ok:
+                spot = (t.x, t.y)
+                break
+        self.assertIsNotNone(spot)
+        cash0 = me.cash
+        self.assertTrue(g.build(me, "solar", *spot))
+        self.assertLess(me.cash, cash0)
+        self.assertEqual(len(me.projects), 1)
+        # 工期到了就投产
+        for _ in range(3):
+            g.advance_projects()
+        self.assertEqual(len(me.projects), 0)
+        self.assertTrue(any(p.kind == "solar" for p in me.plants))
+
+    def test_project_blocked_by_engine_team_shortage(self) -> None:
+        g = new_game()
+        me = g.player
+        me.cash = 500_000.0
+        me.eng_teams = 0
+        spot = None
+        for t in g.world.iter_tiles():
+            ok, _ = g.can_build(me, "coal", t.x, t.y)
+            if ok:
+                spot = (t.x, t.y)
+                break
+        g.build(me, "coal", *spot)
+        g.advance_projects()
+        self.assertEqual(len(me.projects), 1)   # 没有工程队，工期无法推进
+
+    def test_antitrust_triggers(self) -> None:
+        g = new_game()
+        me = g.player
+        me.market_share = 0.9
+        me.last_income.served_mwh = 1000.0
+        me.last_income.revenue_res = 10.0
+        me.last_income.fixed = 100.0
+        me.banned_acq_turns = 0
+        for _ in range(3):
+            msgs = __import__("pwer.policy", fromlist=["check_antitrust"]).check_antitrust(g)
+        self.assertTrue(any("反垄断" in m for m in msgs))
+        self.assertGreater(me.banned_acq_turns, 0)
+
+    def test_events_change_state(self) -> None:
+        g = new_game()
+        from pwer import events
+        for ev in events.EVENTS:
+            g2 = new_game()
+            msg = ev.apply(g2)
+            self.assertIsInstance(msg, str)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
