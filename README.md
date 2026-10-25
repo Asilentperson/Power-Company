@@ -5,11 +5,8 @@
 
 纯 Python + tkinter，**零第三方依赖**，双击即玩。
 
-![主界面](docs/screenshots/10_ops.png)
-
-| 财报 | 交易所 |
-|---|---|
-| ![财报](docs/screenshots/11_finance.png) | ![交易所](docs/screenshots/12_market.png) |
+> 仓库只放源码：没有任何图片、二进制或打包产物。想看图就直接跑
+> `python main.py`，或用 `python tools/demo_shot.py 12` 自动截图。
 
 ---
 
@@ -51,7 +48,7 @@ python tools/sim.py 12 noisy   # 每回合打印完整利润表
 python tools/balance.py 6      # 机器人跑 6 局，统计胜率与达成回合
 python -m unittest discover -s tests -v   # 29 个引擎单元测试
 python tools/ui_smoke.py       # 界面交互冒烟测试（建造/买股/控股/合并）
-python tools/demo_shot.py 12   # 自动截图到 docs/screenshots/（需 Pillow）
+python tools/demo_shot.py 12   # 自动截图到 docs/screenshots/（需 Pillow，已 gitignore）
 ```
 
 ---
@@ -123,8 +120,7 @@ pwer/
 build.bat                打包成 Windows exe（自动探测 Python + 自检）
 tests/test_engine.py     29 个不变量测试
 tools/                   开发工具：无头模拟、胜率验证、界面冒烟、图标与打包辅助
-docs/screenshots/        截图（仅 README 展示用，可整目录删除）
-assets/app.ico           应用图标
+                         （app.ico 由 tools/make_icon.py 现场生成，不入库）
 DESIGN.md                设计文档 → 实现映射、完整数值表与公式
 ```
 

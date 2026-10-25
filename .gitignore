@@ -9,6 +9,10 @@ venv/
 saves/
 *.log
 
+# ---- 生成物：图标与截图不入库（纯代码仓库）----
+assets/
+docs/screenshots/
+
 # ---- 打包产物与大文件（exe 用 GitHub Releases 发，不要进仓库）----
 build/
 dist/
