@@ -5,9 +5,6 @@
 
 纯 Python + tkinter，**零第三方依赖**，双击即玩。
 
-> 仓库只放源码：没有任何图片、二进制或打包产物。想看图就直接跑
-> `python main.py`，或用 `python tools/demo_shot.py 12` 自动截图。
-
 ---
 
 ## 快速开始
