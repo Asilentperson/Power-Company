@@ -5,11 +5,11 @@
 
 纯 Python + tkinter，**零第三方依赖**，双击即玩。
 
-![主界面](shots/10_ops.png)
+![主界面](docs/screenshots/10_ops.png)
 
 | 财报 | 交易所 |
 |---|---|
-| ![财报](shots/11_finance.png) | ![交易所](shots/12_market.png) |
+| ![财报](docs/screenshots/11_finance.png) | ![交易所](docs/screenshots/12_market.png) |
 
 ---
 
@@ -42,7 +42,7 @@ build.bat onefile     :: 生成 dist\电力公司.exe（单文件，首次启动
   再不行落系统临时目录（便携版 / U 盘 / 受限权限都能跑）。
 - 分发时把 `dist\电力公司` 整个文件夹压成 zip 即可。
 
-其他入口：
+其他入口（都是开发自用工具，游戏本体不需要它们）：
 
 ```bash
 python main.py --selftest      # 无窗口自检（打包后验收用）
@@ -51,7 +51,7 @@ python tools/sim.py 12 noisy   # 每回合打印完整利润表
 python tools/balance.py 6      # 机器人跑 6 局，统计胜率与达成回合
 python -m unittest discover -s tests -v   # 29 个引擎单元测试
 python tools/ui_smoke.py       # 界面交互冒烟测试（建造/买股/控股/合并）
-python tools/demo_shot.py 12   # 自动截图到 shots/
+python tools/demo_shot.py 12   # 自动截图到 docs/screenshots/（需 Pillow）
 ```
 
 ---
@@ -120,9 +120,11 @@ pwer/
     app.py               主窗口：顶栏 / 地图 / 四个页签 / 底栏
     mapview.py           2D 格子地图绘制与点击
     scale.py             DPI 缩放
+build.bat                打包成 Windows exe（自动探测 Python + 自检）
 tests/test_engine.py     29 个不变量测试
-tools/                   无头模拟、截图、界面冒烟测试
-shots/                   截图
+tools/                   开发工具：无头模拟、胜率验证、界面冒烟、图标与打包辅助
+docs/screenshots/        截图（仅 README 展示用，可整目录删除）
+assets/app.ico           应用图标
 DESIGN.md                设计文档 → 实现映射、完整数值表与公式
 ```
 

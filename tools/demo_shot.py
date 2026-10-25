@@ -17,7 +17,7 @@ from PIL import ImageGrab  # noqa: E402
 from pwer.ui.app import App  # noqa: E402
 from tools.sim import auto_play_player  # noqa: E402
 
-OUT = Path(__file__).resolve().parents[1] / "shots"
+OUT = Path(__file__).resolve().parents[1] / "docs" / "screenshots"
 
 
 def snap(app: App, name: str) -> None:

@@ -57,10 +57,6 @@ def main() -> None:
     sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
     base.save(OUT, format="ICO", sizes=sizes)
     print(f"已生成 {OUT} ({OUT.stat().st_size / 1024:.1f} KB)")
-    # 同时留一张 PNG 方便预览
-    png = OUT.with_suffix(".png")
-    base.save(png)
-    print(f"预览图 {png}")
 
 
 if __name__ == "__main__":
