@@ -315,5 +315,71 @@ class TestEngine(unittest.TestCase):
             self.assertIsInstance(msg, str)
 
 
+class TestStockCandles(unittest.TestCase):
+    """股市页的 K 线：每回合一根，开=上回合收，高/低包住实体。"""
+
+    def setUp(self) -> None:
+        self.g = new_game()
+        self.co = self.g.player
+
+    def test_one_candle_per_turn(self) -> None:
+        for _ in range(5):
+            self.g.end_turn()
+        self.assertEqual(len(self.co.candles), 5)
+
+    def test_ohlc_consistent(self) -> None:
+        for _ in range(8):
+            self.g.end_turn()
+        prev_close = 12.0
+        for o, hi, lo, c in self.co.candles:
+            self.assertAlmostEqual(o, prev_close, places=6)   # 开盘 = 上回合收盘
+            self.assertLessEqual(lo, min(o, c) + 1e-9)
+            self.assertGreaterEqual(hi, max(o, c) - 1e-9)
+            self.assertGreater(lo, 0.0)
+            prev_close = c
+
+    def test_trade_shows_in_wick(self) -> None:
+        """玩家买入会把价格顶上去，这根 K 线的最高价要能看见。"""
+        tgt = next(c for c in self.g.listed() if c.idx != self.g.player_idx)
+        before = tgt.price
+        qty = max(1.0, tgt.shares * 0.02)
+        ma.buy_shares(self.g, self.g.player_idx, tgt, qty)
+        self.assertGreater(tgt.price, before)
+        self.assertGreaterEqual(tgt.turn_high, tgt.price - 1e-9)
+
+    def test_old_save_without_candle_fields(self) -> None:
+        """旧存档里没有行情字段，读档后必须自动补齐而不是崩。"""
+        from pwer.company import Company
+        co = Company(idx=0, name="旧档")
+        state = {k: v for k, v in co.__dict__.items()
+                 if k not in ("candles", "turn_open", "turn_high", "turn_low")}
+        old = object.__new__(Company)          # 模拟 pickle 反序列化：不跑 __init__
+        old.__setstate__(state)
+        self.assertEqual(old.candles, [])
+        self.assertAlmostEqual(old.turn_open, old.price)
+
+
+class TestIssueShares(unittest.TestCase):
+    """增发是折价配售：拿现金、摊股本，但市值不能被印出来。"""
+
+    def test_issue_does_not_inflate_market_cap(self) -> None:
+        g = new_game()
+        co = g.player
+        cap0, price0, cash0, shares0 = co.market_cap(), co.price, co.cash, co.shares
+        cash = ma.issue_shares(g, co, co.shares * 0.06)
+        self.assertGreater(cash, 0.0)                # 募到钱
+        self.assertGreater(co.shares, shares0)       # 股本变大（稀释）
+        self.assertGreater(co.cash, cash0)           # 现金变多
+        self.assertLess(co.price, price0)            # 股价被砸下来
+        self.assertLess(co.market_cap(), cap0)       # 市值不能变大
+
+    def test_issue_is_capped(self) -> None:
+        g = new_game()
+        co = g.player
+        shares0 = co.shares
+        ma.issue_shares(g, co, co.shares * 5)        # 想发 500%
+        self.assertLessEqual(co.shares, shares0 * 1.15 + 1e-6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

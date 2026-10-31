@@ -253,3 +253,19 @@ UI_GOOD = "#57c785"
 UI_BAD = "#e0605e"
 UI_WARN = "#e5b454"
 COMPANY_COLORS = ("#4fa3ff", "#e0605e", "#57c785", "#c98be0")
+
+# ---------------------------------------------------------------- 版本 / 启动页
+VERSION = "1.0.0"
+BUILD = "2026.05.01"
+MULTIPLAYER_READY = False      # 联机模块尚未接入；启动页状态灯按这个值说话，不写死"可联机"
+
+# 启动页（docs/ui_start_screen.md 的色板；只属于 UI，不参与游戏数值）
+UI_START_BG = "#0B0B0C"
+UI_START_INK = "#F4F2EC"
+UI_START_DIM1 = "#A6A6AC"
+UI_START_DIM2 = "#55555C"
+UI_START_RULE = "#26262B"
+UI_START_BLUE = "#21449C"
+UI_START_RED = "#E1251B"
+UI_START_YELLOW = "#F2E600"
+UI_START_GREEN = "#35C15A"

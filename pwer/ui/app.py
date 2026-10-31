@@ -3,7 +3,7 @@
 布局：
     顶栏   —— 回合、现金、负债、股价、市值、份额、政策
     左栏   —— 2D 格子地图 + 公司图例 + 选中地块信息 + 回合动态
-    右栏   —— 经营 / 财报 / 交易所 / 政策日志 四个页签
+    右栏   —— 经营 / 财报 / 股市 / 政策日志 四个页签
     底栏   —— 结束回合 + 建造模式提示
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ from ..constants import (
 )
 from ..engine import Game
 from ..ma import MaError, ownership, player_stake
-from . import mapview, scale
+from . import mapview, prefs, scale, set_window_icon
 from .mapview import MapView, tile_tooltip
 
 scale.enable_dpi_awareness()
@@ -44,10 +44,26 @@ FONT = "Microsoft YaHei UI"
 BG2 = "#1b1e24"
 TS_LOGICAL = 36          # 每格逻辑像素（乘 DPI 缩放）
 WIN_W, WIN_H = 1240, 736
+# 股市配色：沿用 A 股习惯「红涨绿跌」。财报里的盈亏仍用 UI_GOOD/UI_BAD，两者语义不同：
+#   涨跌 = 相对上一根 K 线的方向；盈亏 = 经营结果的好坏。
+K_UP = "#d95b52"
+K_DOWN = "#43a06b"
+
+
+def chg_pct(co: Company) -> float:
+    """涨跌幅基准：本回合动过价（买入/卖出/增发）就对齐本回合开盘价，否则用上回合收盘价。
+
+    这样"点一下增发"能立刻看到 −10.8%，而"结束回合"时仍然显示刚结算那回合的涨跌。
+    """
+    ref = co.price_prev or co.price
+    if getattr(co, "turn_open", 0.0) and abs(co.price - co.turn_open) > 1e-9:
+        ref = co.turn_open
+    return (co.price / ref - 1.0) * 100 if ref else 0.0
 
 
 class App(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, game: Game | None = None, intro: bool = True,
+                 show_start: bool = False, seed: int = 20240501) -> None:
         super().__init__()
         S = scale.init(self)
         mapview.TS = scale.px(TS_LOGICAL)
@@ -55,30 +71,112 @@ class App(tk.Tk):
         self.geometry(f"{scale.px(WIN_W)}x{scale.px(WIN_H)}+0+0")
         self.minsize(scale.px(1120), scale.px(700))
         self.configure(bg=UI_BG)
-        self.game = Game.new_game()
+        set_window_icon(self)
+        self.game = game if game is not None else Game.new_game()
         self.build_mode: str | None = None
         self.selected: tuple[int, int] | None = None
         self._syncing = False
         self._toast_job = None
         self._log_rendered = 0
+        self.panel: str | None = None      # 当前打开的抽屉：policy / stock / company
+        self._map_fit_job = None
+        self._seed = seed
+        self.start = None                  # 启动页覆盖层（不是独立窗口）
         self._style()
         self._menu()
-        self._build_top()
+        self._apply_display()              # 放在 _menu 之后：全屏要把菜单栏一起收起来
+        self._build_buildbar()             # 红：底部建造条（先占位，保证地图吃剩下的空间）
+        self._build_top()                  # 青：数据条 + 蓝：时间块
         body = tk.Frame(self, bg=UI_BG)
         body.pack(fill="both", expand=True)
-        self._build_left(body)
-        self._build_right(body)
-        self._build_bottom()
-        self._bind_keys()
+        self._build_rail(body)             # 黄/绿：左侧页签轨
+        self._build_stage(body)            # 白：地图 + 抽屉
         self.refresh()
+        self.after(80, self._fit_map)
+        if show_start:
+            # 启动页盖在同一个窗口上：点【开始】只把覆盖层摘掉，不销毁窗口再开一个
+            self.open_start()
+        else:
+            self._bind_keys()
+            if intro and not os.environ.get("PWER_NO_INTRO"):
+                self.after(200, self._intro)
+
+    # ------------------------------------------------------------ 启动页覆盖层
+    def open_start(self) -> None:
+        from .start import StartScreen
+
+        try:
+            self.config(menu="")           # 启动页期间收起菜单栏
+        except tk.TclError:
+            pass
+        self.start = StartScreen(
+            self,
+            on_new=self._start_new,
+            on_continue=self._start_continue,
+            on_quit=self.destroy,
+            on_display=self._apply_display,
+        )
+        self.start.place(x=0, y=0, relwidth=1, relheight=1)
+        self.start.lift()
+
+    def _start_new(self) -> None:
+        self.start = None
+        self._apply_display()              # 菜单栏/全屏状态交还给游戏
+        self._bind_keys()
+        self.game = Game.new_game(self._seed)
+        self.refresh()
+        self._fit_map()
         if not os.environ.get("PWER_NO_INTRO"):
-            self.after(200, self._intro)
+            self.after(160, self._intro)
+
+    def _start_continue(self, game) -> None:
+        self.start = None
+        self._apply_display()
+        self._bind_keys()
+        self.game = game
+        self.build_mode = None
+        self.map.build_mode = None
+        self.map.valid_tiles = set()
+        self.selected = None
+        self.refresh()
+        self._fit_map()
+        self.toast("存档已载入")
 
     def _bind_keys(self) -> None:
         self.bind("<Control-Return>", lambda e: self.end_turn())
-        self.bind("<Escape>", lambda e: self.cancel_build() if self.build_mode else None)
-        for i, tab in enumerate((self.tab_ops, self.tab_fin, self.tab_mkt, self.tab_log), 1):
-            self.bind(f"<Control-Key-{i}>", lambda e, t=tab: self.nb.select(t))
+        self.bind("<Escape>", self._on_escape)
+        self.bind("<F11>", self._toggle_display)
+        self.bind("<Control-Key-1>", lambda e: self.toggle_panel("policy"))
+        self.bind("<Control-Key-2>", lambda e: self.toggle_panel("stock"))
+        self.bind("<Control-Key-3>", lambda e: self.toggle_panel("company"))
+
+    def _apply_display(self) -> None:
+        """跟启动页共用同一个偏好：全屏就真全屏（连标题栏、任务栏、菜单栏一起让位）。"""
+        full = prefs.get("display") == "fullscreen"
+        try:
+            # Windows 下 tkinter 的菜单栏不吃 -fullscreen，必须手动摘掉，否则顶部留一条 39px 的白条
+            self.config(menu="" if full else getattr(self, "_menubar", ""))
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-fullscreen", full)
+        except tk.TclError:
+            return
+        if not full:
+            self.geometry(f"{scale.px(WIN_W)}x{scale.px(WIN_H)}+0+0")
+
+    def _toggle_display(self, _e=None) -> None:
+        prefs.put("display", "windowed" if prefs.get("display") == "fullscreen"
+                  else "fullscreen")
+        prefs.save()
+        self._apply_display()
+        self.after(120, self._fit_map)
+
+    def _on_escape(self, _e=None) -> None:
+        if self.build_mode:
+            self.cancel_build()
+        elif self.panel:
+            self.toggle_panel(None)
 
     # ------------------------------------------------------------ 样式
     def _style(self) -> None:
@@ -122,84 +220,222 @@ class App(tk.Tk):
         h = tk.Menu(bar, tearoff=0, bg=UI_PANEL, fg=UI_TEXT)
         h.add_command(label="玩法与规则", command=self.show_rules)
         bar.add_cascade(label="帮助", menu=h)
+        self._menubar = bar
         self.config(menu=bar)
 
-    # ------------------------------------------------------------ 顶栏
+    # ------------------------------------------------------------ 顶部：数据条 + 时间块
     def _build_top(self) -> None:
-        bar = tk.Frame(self, bg="#15181d", height=scale.px(48))
-        bar.pack(fill="x", side="top")
-        bar.pack_propagate(False)
-        self.lbl_turn = tk.Label(bar, text="", bg="#15181d", fg=UI_TEXT,
-                                 font=(FONT, 13, "bold"))
-        self.lbl_turn.pack(side="left", padx=scale.px(12))
+        P = scale.px
+        top = tk.Frame(self, bg="#15181d", height=P(84))
+        top.pack(fill="x", side="top")
+        top.pack_propagate(False)
+
+        # 蓝：时间块（右上）——回合 / 年季 / 结束回合
+        time_box = tk.Frame(top, bg="#1b2b4d", width=P(340))
+        time_box.pack(side="right", fill="y")
+        time_box.pack_propagate(False)
+        self.lbl_turn = tk.Label(time_box, text="", bg="#1b2b4d", fg="#ffffff",
+                                 font=(FONT, 12, "bold"), anchor="w")
+        self.lbl_turn.pack(fill="x", padx=P(12), pady=(P(8), 0))
+        row = tk.Frame(time_box, bg="#1b2b4d")
+        row.pack(fill="x", padx=P(12), pady=(P(2), P(8)))
+        self.lbl_season = tk.Label(row, text="", bg="#1b2b4d", fg="#9fb6e0",
+                                   font=(FONT, 8), anchor="w")
+        self.lbl_season.pack(side="left")
+        self.btn_end = ttk.Button(row, text="结束回合 ▶", command=self.end_turn,
+                                  style="Accent.TButton")
+        self.btn_end.pack(side="right")
+
+        # 青：数据条（左上），底部 3px 青色边对应设计稿的"数据显示"
+        stats = tk.Frame(top, bg="#15181d")
+        stats.pack(side="left", fill="both", expand=True)
+        tk.Frame(stats, bg="#3f9c8f", height=P(3)).pack(side="bottom", fill="x")
+        inner = tk.Frame(stats, bg="#15181d")
+        inner.pack(fill="x", padx=P(10), pady=(P(5), 0))
         self.top_stats = {}
         for key, label, color in (
             ("cash", "现金", UI_TEXT), ("debt", "负债", UI_DIM),
             ("price", "股价", UI_ACCENT), ("cap", "市值", UI_GOOD),
             ("share", "市占", UI_WARN), ("policy", "监管阶段", UI_DIM),
         ):
-            f = tk.Frame(bar, bg="#15181d")
-            f.pack(side="left", padx=scale.px(9))
+            f = tk.Frame(inner, bg="#15181d")
+            f.pack(side="left", padx=P(8))
             tk.Label(f, text=label, bg="#15181d", fg="#6f7784",
                      font=(FONT, 8)).pack(anchor="w")
             lab = tk.Label(f, text="-", bg="#15181d", fg=color, font=(FONT, 11, "bold"))
             lab.pack(anchor="w")
             self.top_stats[key] = lab
 
-    # ------------------------------------------------------------ 左栏
-    def _build_left(self, parent) -> None:
-        left = tk.Frame(parent, bg=UI_BG)
-        left.pack(side="left", fill="both", expand=False, padx=(scale.px(6), 0),
-                  pady=scale.px(6))
-        self.map = MapView(left, self.on_tile_click, self.on_hover)
-        self.map.pack(anchor="nw")
-        # 图例
-        self.legend = tk.Frame(left, bg=UI_PANEL)
-        self.legend.pack(fill="x", pady=(scale.px(4), 0))
-        self.legend_row = tk.Frame(self.legend, bg=UI_PANEL)
-        self.legend_row.pack(fill="x", padx=scale.px(6), pady=scale.px(3))
-        # 地块信息
-        info = tk.Frame(left, bg=UI_PANEL)
-        info.pack(fill="x", pady=(scale.px(4), 0))
-        self.lbl_tile = tk.Label(info, text="点击地图查看地块", bg=UI_PANEL, fg=UI_DIM,
-                                 anchor="w", justify="left",
-                                 wraplength=mapview.TS * 18 - scale.px(12),
-                                 font=(FONT, 9))
-        self.lbl_tile.pack(fill="x", padx=scale.px(8), pady=scale.px(4))
-        # 回合动态
-        news = tk.Frame(left, bg=UI_PANEL)
-        news.pack(fill="both", expand=True, pady=(scale.px(4), 0))
-        tk.Label(news, text="回合动态", bg=UI_PANEL, fg=UI_ACCENT,
-                 font=(FONT, 9, "bold")).pack(anchor="w", padx=scale.px(8),
-                                              pady=(scale.px(3), 0))
-        self.log_list = tk.Listbox(news, bg=BG2, fg="#c9cfd8", bd=0, height=5,
-                                   font=(FONT, 9), selectbackground="#35507a",
-                                   highlightthickness=0, activestyle="none")
-        self.log_list.pack(fill="both", expand=True, padx=scale.px(8),
-                           pady=(scale.px(2), scale.px(6)))
+    # ------------------------------------------------------------ 左轨：页签 + 其它按钮
+    def _build_rail(self, parent) -> None:
+        P = scale.px
+        rail = tk.Frame(parent, bg="#12151a", width=P(116))
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        tk.Frame(rail, bg="#f2e600", width=P(3)).pack(side="left", fill="y")
+        inner = tk.Frame(rail, bg="#12151a")
+        inner.pack(side="left", fill="both", expand=True, padx=(P(8), P(6)), pady=P(10))
 
-    # ------------------------------------------------------------ 右栏
-    def _build_right(self, parent) -> None:
-        right = tk.Frame(parent, bg=UI_BG)
-        right.pack(side="right", fill="both", expand=True,
-                   padx=scale.px(6), pady=scale.px(6))
-        nb = ttk.Notebook(right)
-        nb.pack(fill="both", expand=True)
-        self.nb = nb
-        self.tab_ops = tk.Frame(nb, bg=UI_PANEL)
-        self.tab_fin = tk.Frame(nb, bg=UI_PANEL)
-        self.tab_mkt = tk.Frame(nb, bg=UI_PANEL)
-        self.tab_log = tk.Frame(nb, bg=UI_PANEL)
-        nb.add(self.tab_ops, text=" 经营 ")
-        nb.add(self.tab_fin, text=" 财报 ")
-        nb.add(self.tab_mkt, text=" 交易所 ")
-        nb.add(self.tab_log, text=" 政策·日志 ")
+        self.rail_items: dict[str, dict] = {}
+        for key, zh, en in (("policy", "政策", "POLICY"),
+                            ("stock", "股市", "MARKET"),
+                            ("company", "公司", "COMPANY")):
+            self.rail_items[key] = self._rail_button(inner, key, zh, en)
+
+        tk.Frame(inner, bg="#2b2f36", height=1).pack(fill="x", pady=P(10))
+        tk.Label(inner, text="其它", bg="#12151a", fg="#4f5a4a", font=(FONT, 7),
+                 anchor="w").pack(fill="x", pady=(0, P(2)))
+        for label, cmd in (("存档", self.save_game), ("读档", self.load_game),
+                           ("规则", self.show_rules), ("退出", self.destroy)):
+            tk.Button(inner, text=label, command=cmd, bg="#16211a", fg="#8fd6a8",
+                      activebackground="#22372a", activeforeground="#b7f0c8",
+                      bd=0, relief="flat", font=(FONT, 9), anchor="w",
+                      padx=P(8), pady=P(5), cursor="hand2").pack(fill="x", pady=P(2))
+
+    def _rail_button(self, parent, key: str, zh: str, en: str) -> dict:
+        P = scale.px
+        box = tk.Frame(parent, bg="#1a1e25", cursor="hand2")
+        box.pack(fill="x", pady=P(3))
+        bar = tk.Frame(box, bg="#12151a", width=P(3))
+        bar.pack(side="left", fill="y")
+        txt = tk.Frame(box, bg="#1a1e25")
+        txt.pack(side="left", fill="both", expand=True, padx=P(8), pady=P(6))
+        zh_lbl = tk.Label(txt, text=zh, bg="#1a1e25", fg="#e6e6e6",
+                          font=(FONT, 11, "bold"), anchor="w")
+        zh_lbl.pack(fill="x")
+        en_lbl = tk.Label(txt, text=en, bg="#1a1e25", fg="#6f7784",
+                          font=(FONT, 7), anchor="w")
+        en_lbl.pack(fill="x")
+        widgets = (box, bar, txt, zh_lbl, en_lbl)
+        for w in widgets:
+            w.bind("<Button-1>", lambda e, k=key: self.toggle_panel(k))
+        return {"box": box, "bar": bar, "txt": txt, "zh": zh_lbl, "en": en_lbl}
+
+    def _sync_rail(self) -> None:
+        for key, it in self.rail_items.items():
+            on = (self.panel == key)
+            bg = "#2b2a12" if on else "#1a1e25"
+            it["box"].config(bg=bg)
+            it["txt"].config(bg=bg)
+            it["zh"].config(bg=bg, fg="#f2e600" if on else "#e6e6e6")
+            it["en"].config(bg=bg, fg="#b8ad3a" if on else "#6f7784")
+            it["bar"].config(bg="#f2e600" if on else "#12151a")
+
+    # ------------------------------------------------------------ 中间：地图 + 抽屉
+    def _build_stage(self, parent) -> None:
+        P = scale.px
+        stage = tk.Frame(parent, bg=UI_BG)
+        stage.pack(side="left", fill="both", expand=True)
+        self.stage = stage
+
+        strip = tk.Frame(stage, bg=UI_PANEL)
+        strip.pack(side="bottom", fill="x")
+        self.legend_row = tk.Frame(strip, bg=UI_PANEL)
+        self.legend_row.pack(side="left", padx=P(8), pady=P(3))
+        self.lbl_tile = tk.Label(strip, text="点击地图查看地块", bg=UI_PANEL, fg=UI_DIM,
+                                 anchor="w", justify="left", font=(FONT, 8))
+        self.lbl_tile.pack(side="left", fill="x", expand=True, padx=P(8))
+
+        self.map = MapView(stage, self.on_tile_click, self.on_hover)
+        self.map.place(relx=0.5, rely=0.5, anchor="center")
+
+        # 抽屉：选中左侧页签时盖在地图右侧，不挤压地图
+        self.drawer = tk.Frame(stage, bg=UI_PANEL, highlightthickness=1,
+                               highlightbackground="#2f3540")
+        head = tk.Frame(self.drawer, bg="#1a1e25")
+        head.pack(fill="x")
+        self.drawer_title = tk.Label(head, text="", bg="#1a1e25", fg=UI_TEXT,
+                                     font=(FONT, 10, "bold"), anchor="w")
+        self.drawer_title.pack(side="left", padx=P(10), pady=P(6))
+        tk.Button(head, text="✕", command=lambda: self.toggle_panel(None),
+                  bg="#1a1e25", fg="#8a93a3", activebackground="#242a33",
+                  bd=0, relief="flat", font=(FONT, 9),
+                  cursor="hand2").pack(side="right", padx=P(6))
+        body = tk.Frame(self.drawer, bg=UI_PANEL)
+        body.pack(fill="both", expand=True)
+        self.drawer_body = body
+
+        self.tab_log = tk.Frame(body, bg=UI_PANEL)
+        self.tab_mkt = tk.Frame(body, bg=UI_PANEL)
+        self._co_panel = tk.Frame(body, bg=UI_PANEL)
+        self._build_log(self.tab_log)
+        self._build_mkt(self.tab_mkt)
+        self._build_company(self._co_panel)
+
+        stage.bind("<Configure>", self._on_stage_resize)
+
+    # ------------------------------------------------------------ 公司面板（运营 / 财报）
+    def _build_company(self, root) -> None:
+        P = scale.px
+        seg = tk.Frame(root, bg=UI_PANEL)
+        seg.pack(fill="x", padx=P(8), pady=(P(6), P(2)))
+        self.co_tab = "ops"
+        self.btn_co_ops = ttk.Button(seg, text="运营", style="Small.TButton",
+                                     command=lambda: self.show_company_tab("ops"))
+        self.btn_co_ops.pack(side="left")
+        self.btn_co_fin = ttk.Button(seg, text="财报", style="Small.TButton",
+                                     command=lambda: self.show_company_tab("fin"))
+        self.btn_co_fin.pack(side="left", padx=P(4))
+        self.co_body = tk.Frame(root, bg=UI_PANEL)
+        self.co_body.pack(fill="both", expand=True)
+        self.tab_ops = tk.Frame(self.co_body, bg=UI_PANEL)
+        self.tab_fin = tk.Frame(self.co_body, bg=UI_PANEL)
         self._build_ops(self.tab_ops)
         self._build_fin(self.tab_fin)
-        self._build_mkt(self.tab_mkt)
-        self._build_log(self.tab_log)
+        self.show_company_tab("ops")
 
-    # ------------------------------------------------------------ 经营页
+    def show_company_tab(self, which: str) -> None:
+        self.co_tab = which
+        for f in (self.tab_ops, self.tab_fin):
+            f.pack_forget()
+        (self.tab_ops if which == "ops" else self.tab_fin).pack(fill="both", expand=True)
+        self.btn_co_ops.config(style="Accent.TButton" if which == "ops" else "Small.TButton")
+        self.btn_co_fin.config(style="Accent.TButton" if which == "fin" else "Small.TButton")
+
+    # ------------------------------------------------------------ 抽屉开关
+    def toggle_panel(self, key: str | None) -> None:
+        if key == self.panel:
+            key = None
+        self.panel = key
+        if key is None:
+            self.drawer.place_forget()
+        else:
+            for f in (self.tab_log, self.tab_mkt, self._co_panel):
+                f.pack_forget()
+            frame, title = {
+                "policy": (self.tab_log, "政策 · 日志"),
+                "stock": (self.tab_mkt, "股市 · 行情"),
+                "company": (self._co_panel, "公司 · 经营财报"),
+            }[key]
+            self.drawer_title.config(text=title)
+            frame.pack(fill="both", expand=True)
+            w = min(scale.px(500), max(scale.px(360),
+                                       int(self.stage.winfo_width() * 0.44)))
+            self.drawer.place(relx=1.0, rely=0.0, anchor="ne", width=w,
+                              relheight=1.0, x=-scale.px(6), y=scale.px(4))
+        self._sync_rail()
+        if key == "stock":
+            self.draw_kline()
+
+    def _on_stage_resize(self, _e=None) -> None:
+        if self._map_fit_job is not None:
+            return
+        self._map_fit_job = self.after(80, self._fit_map)
+
+    def _fit_map(self) -> None:
+        self._map_fit_job = None
+        if not hasattr(self, "map"):
+            return
+        w = self.stage.winfo_width() - scale.px(12)
+        h = self.stage.winfo_height() - scale.px(34)
+        if w < 80 or h < 80:
+            return
+        ts = int(min(w / 18, h / 12))
+        ts = max(scale.px(18), min(ts, scale.px(64)))
+        if ts != mapview.TS:
+            self.map.set_tile(ts)
+
+    # ------------------------------------------------------------ 公司 · 运营
     def _build_ops(self, root) -> None:
         P = scale.px
         box = tk.Frame(root, bg=UI_PANEL)
@@ -225,8 +461,8 @@ class App(tk.Tk):
                  font=(FONT, 10, "bold")).pack(anchor="w")
         self.var_res = tk.DoubleVar(value=500.0)
         self.var_ind = tk.DoubleVar(value=460.0)
-        for label, var, hint in (("居民", self.var_res, "对涨价与停电极敏感"),
-                                 ("工业", self.var_ind, "承受力强，适合放量")):
+        for label, var, hint in (("居民", self.var_res, "价格敏感"),
+                                 ("工业", self.var_ind, "承受力强")):
             row = tk.Frame(box, bg=UI_PANEL)
             row.pack(fill="x", pady=P(1))
             tk.Label(row, text=label, bg=UI_PANEL, fg=UI_TEXT, width=4,
@@ -254,9 +490,9 @@ class App(tk.Tk):
                  font=(FONT, 10, "bold")).pack(anchor="w")
         cols = ("kind", "cap", "cf", "fixed", "gen", "status")
         self.tv_plants = ttk.Treeview(box, columns=cols, show="headings", height=4)
-        for c, t, w in (("kind", "电厂", 100), ("cap", "容量", 55), ("cf", "出力", 50),
-                        ("fixed", "固定成本/季", 85), ("gen", "本季发电", 80),
-                        ("status", "状态", 80)):
+        for c, t, w in (("kind", "电厂", 84), ("cap", "容量", 50), ("cf", "出力", 44),
+                        ("fixed", "固定/季", 72), ("gen", "本季发电", 70),
+                        ("status", "状态", 88)):
             self.tv_plants.heading(c, text=t)
             self.tv_plants.column(c, width=P(w), anchor="center")
         self.tv_plants.pack(fill="x")
@@ -268,33 +504,6 @@ class App(tk.Tk):
             self.tv_projects.column(c, width=P(w), anchor="center")
         self.tv_projects.tag_configure("empty", foreground="#6f7784")
         self.tv_projects.pack(fill="x", pady=(P(3), 0))
-
-        box = tk.Frame(root, bg=UI_PANEL)
-        box.pack(fill="x", padx=P(8), pady=(P(4), 0))
-        head = tk.Frame(box, bg=UI_PANEL)
-        head.pack(fill="x")
-        tk.Label(head, text="建造（先选类型，再点地图）", bg=UI_PANEL, fg=UI_ACCENT,
-                 font=(FONT, 10, "bold")).pack(side="left")
-        ttk.Button(head, text="取消", command=self.cancel_build,
-                   style="Small.TButton").pack(side="right")
-        grid = tk.Frame(box, bg=UI_PANEL)
-        grid.pack(fill="x")
-        self.build_buttons: dict[str, ttk.Button] = {}
-        items = [(k, PLANT_SPECS[k]) for k in PLANT_SPECS] + \
-                [(k, INFRA_SPECS[k]) for k in INFRA_SPECS]
-        for i, (kind, spec) in enumerate(items):
-            r, c = divmod(i, 4)
-            cost = spec.capex if kind in INFRA_SPECS else spec.capex_per_mw * spec.cap
-            b = ttk.Button(grid, text=f"{spec.name} {money(cost)}", width=13,
-                           command=lambda k=kind: self.set_build(k))
-            b.grid(row=r, column=c, padx=P(1), pady=P(1), sticky="ew")
-            self.build_buttons[kind] = b
-        for c in range(4):
-            grid.columnconfigure(c, weight=1)
-        # 内联校验：钱不够/没地块的类型直接置灰，并说明原因（不让玩家点了才报错）
-        self.lbl_build_info = tk.Label(box, text="", bg=UI_PANEL, fg=UI_DIM,
-                                       font=(FONT, 8), anchor="w", justify="left")
-        self.lbl_build_info.pack(fill="x", pady=(P(2), 0))
 
         box = tk.Frame(root, bg=UI_PANEL)
         box.pack(fill="x", padx=P(8), pady=(P(4), P(8)))
@@ -351,23 +560,37 @@ class App(tk.Tk):
         self.spark = tk.Canvas(box, height=P(56), bg=BG2, highlightthickness=0)
         self.spark.pack(fill="x", pady=(P(2), 0))
 
-    # ------------------------------------------------------------ 交易所页
+    # ------------------------------------------------------------ 股市页
     def _build_mkt(self, root) -> None:
         P = scale.px
+        # 行情：选中公司的 K 线（每回合一根，开/高/低/收）
+        box = tk.Frame(root, bg=UI_PANEL)
+        box.pack(fill="x", padx=P(8), pady=(P(6), P(2)))
+        head = tk.Frame(box, bg=UI_PANEL)
+        head.pack(fill="x")
+        self.lbl_kline = tk.Label(head, text="", bg=UI_PANEL, fg=UI_TEXT,
+                                  font=(FONT, 10, "bold"), anchor="w")
+        self.lbl_kline.pack(side="left")
+        self.lbl_kline2 = tk.Label(head, text="", bg=UI_PANEL, fg=UI_DIM,
+                                   font=(FONT, 7), anchor="e")
+        self.lbl_kline2.pack(side="right")
+        self.cv_kline = tk.Canvas(box, height=P(96), bg=BG2, highlightthickness=0)
+        self.cv_kline.pack(fill="x", pady=(P(2), 0))
+        self.cv_kline.bind("<Configure>", lambda e: self.draw_kline())
+
         head = tk.Frame(root, bg=UI_PANEL)
         head.pack(fill="x", padx=P(8), pady=(P(6), P(2)))
         self.lbl_ceo = tk.Label(head, text="", bg=UI_PANEL, fg=UI_TEXT,
                                 font=(FONT, 10, "bold"), justify="left", anchor="w")
         self.lbl_ceo.pack(fill="x")
-        cols = ("name", "price", "chg", "cap", "my", "equity", "debt", "np", "state")
-        self.tv_mkt = ttk.Treeview(root, columns=cols, show="headings", height=5)
-        for c, t, w in (("name", "公司", 78), ("price", "股价", 50), ("chg", "涨跌", 50),
-                        ("cap", "市值", 64), ("my", "我的持股", 58), ("equity", "净资产", 64),
-                        ("debt", "负债率", 46), ("np", "季度净利", 64), ("state", "状态", 54)):
+        cols = ("name", "price", "chg", "cap", "my", "state")
+        self.tv_mkt = ttk.Treeview(root, columns=cols, show="headings", height=3)
+        for c, t, w in (("name", "公司", 78), ("price", "股价", 52), ("chg", "涨跌", 54),
+                        ("cap", "市值", 66), ("my", "我的持股", 64), ("state", "状态", 58)):
             self.tv_mkt.heading(c, text=t)
             self.tv_mkt.column(c, width=P(w), anchor="center")
         self.tv_mkt.pack(fill="x", padx=P(8))
-        self.tv_mkt.bind("<<TreeviewSelect>>", lambda e: self.refresh_mkt_controls())
+        self.tv_mkt.bind("<<TreeviewSelect>>", lambda e: self._on_pick_company())
 
         ctrl = tk.Frame(root, bg=UI_PANEL)
         ctrl.pack(fill="x", padx=P(8), pady=(P(6), 0))
@@ -406,7 +629,7 @@ class App(tk.Tk):
 
         tk.Label(root, text="控股子公司资产处置", bg=UI_PANEL, fg=UI_ACCENT,
                  font=(FONT, 10, "bold")).pack(anchor="w", padx=P(8), pady=(P(6), P(2)))
-        self.lb_subs = tk.Listbox(root, bg=BG2, fg=UI_TEXT, bd=0, height=4,
+        self.lb_subs = tk.Listbox(root, bg=BG2, fg=UI_TEXT, bd=0, height=2,
                                   font=(FONT, 9), highlightthickness=0)
         self.lb_subs.pack(fill="x", padx=P(8))
         btns = tk.Frame(root, bg=UI_PANEL)
@@ -415,10 +638,100 @@ class App(tk.Tk):
                    style="Small.TButton").pack(side="left")
         tk.Label(root, text="对手情报（机组 / 电价 / 财务风险）", bg=UI_PANEL, fg=UI_ACCENT,
                  font=(FONT, 10, "bold")).pack(anchor="w", padx=P(8), pady=(P(4), P(2)))
-        self.txt_intel = tk.Text(root, bg=BG2, fg="#c9cfd8", bd=0, height=7, wrap="word",
+        self.txt_intel = tk.Text(root, bg=BG2, fg="#c9cfd8", bd=0, height=2, wrap="word",
                                  font=(FONT, 9), highlightthickness=0, padx=P(6), pady=P(4))
         self.txt_intel.pack(fill="both", expand=True, padx=P(8), pady=(0, P(8)))
         self.txt_intel.configure(state="disabled")
+
+    def _on_pick_company(self) -> None:
+        """在行情表里换一家公司：同步刷新股权信息与 K 线。"""
+        self.refresh_mkt_controls()
+        self.draw_kline()
+
+    # ------------------------------------------------------------ K 线
+    def draw_kline(self) -> None:
+        """画选中公司的 K 线：每回合一根，红色阳线 / 绿色阴线。"""
+        if not hasattr(self, "cv_kline"):
+            return
+        cv = self.cv_kline
+        cv.delete("all")
+        P = scale.px
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < P(120) or h < P(50):
+            return
+        tgt = self._sel_company() or self.game.player
+        candles = list(getattr(tgt, "candles", []))
+        # 本回合还没收盘：只要价格动过（比如刚点了增发/买入），就把这根"活的"K 线补上
+        live = None
+        if getattr(tgt, "turn_open", 0.0) > 0:
+            hi_t = max(getattr(tgt, "turn_high", tgt.price), tgt.price)
+            lo_t = min(getattr(tgt, "turn_low", tgt.price), tgt.price)
+            if abs(tgt.price - tgt.turn_open) > 1e-9 or hi_t > lo_t + 1e-9:
+                live = (tgt.turn_open, hi_t, lo_t, tgt.price)
+                candles.append(live)
+        candles = candles[-26:]
+        if not candles:
+            cv.create_text(w // 2, h // 2, text="还没有行情 · 结束一个回合后生成第一根 K 线",
+                           fill=UI_DIM, font=(FONT, 9))
+            self.lbl_kline.config(text=f"{tgt.name}  尚未开盘", fg=UI_DIM)
+            self.lbl_kline2.config(text="")
+            return
+
+        pad_l, pad_r, pad_t, pad_b = P(6), P(52), P(12), P(18)
+        pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
+        hi = max(c[1] for c in candles)
+        lo = min(c[2] for c in candles)
+        if hi - lo < 1e-6:
+            hi, lo = hi * 1.02 + 0.01, lo * 0.98
+        margin = (hi - lo) * 0.08
+        hi, lo = hi + margin, lo - margin
+
+        def yy(v: float) -> float:
+            return pad_t + (hi - v) / (hi - lo) * ph
+
+        for i in range(5):                      # 网格 + 右侧价格刻度
+            v = hi - (hi - lo) * i / 4
+            y = yy(v)
+            cv.create_line(pad_l, y, pad_l + pw, y, fill="#2a2f38")
+            cv.create_text(pad_l + pw + P(6), y, text=f"{v:.1f}", anchor="w",
+                           fill="#6f7784", font=(FONT, 7))
+
+        n = len(candles)
+        slot = pw / max(1, n)
+        bw = max(P(2), slot * 0.62)
+        for i, (o, hh, ll, c) in enumerate(candles):
+            cx = pad_l + slot * (i + 0.5)
+            color = K_UP if c >= o else K_DOWN
+            cv.create_line(cx, yy(hh), cx, yy(ll), fill=color, width=max(1, P(1)))
+            top, bot = yy(max(o, c)), yy(min(o, c))
+            if bot - top < P(1):
+                bot = top + P(1)
+            cv.create_rectangle(cx - bw / 2, top, cx + bw / 2, bot,
+                                fill=color, outline=color)
+
+        last = candles[-1]
+        y = yy(last[3])
+        cv.create_line(pad_l, y, pad_l + pw, y, fill="#565d6b", dash=(2, 3))
+        # 最新价用色块贴标，避免和右侧刻度数字叠在一起看不清
+        tag_x = pad_l + pw + P(3)
+        cv.create_rectangle(tag_x, y - P(8), tag_x + P(46), y + P(8),
+                            fill=K_UP if last[3] >= last[0] else K_DOWN, outline="")
+        cv.create_text(tag_x + P(23), y, text=f"{last[3]:.2f}", fill="#ffffff",
+                       font=(FONT, 8, "bold"))
+        last_turn = self.game.turn if live else self.game.turn - 1
+        cv.create_text(pad_l + P(2), h - P(3), text=f"T{last_turn - n + 1}",
+                       anchor="sw", fill="#6f7784", font=(FONT, 7))
+        cv.create_text(pad_l + pw, h - P(3), text=f"T{last_turn}",
+                       anchor="se", fill="#6f7784", font=(FONT, 7))
+
+        o, hh, ll, c = last
+        chg = (c / candles[-2][3] - 1.0) * 100 if n > 1 else 0.0
+        color = K_UP if c >= o else K_DOWN
+        self.lbl_kline.config(text=f"{tgt.name}  {c:.2f}  {chg:+.1f}%",
+                              fg=color)
+        self.lbl_kline2.config(
+            text=("进行中 · " if live else "")
+                 + f"红涨绿跌 · 开 {o:.2f}  高 {hh:.2f}  低 {ll:.2f}  收 {c:.2f}")
 
     # ------------------------------------------------------------ 日志页
     def _build_log(self, root) -> None:
@@ -440,21 +753,41 @@ class App(tk.Tk):
         self.txt_log.pack(fill="both", expand=True, padx=P(8), pady=(0, P(8)))
         self.txt_log.configure(state="disabled")
 
-    # ------------------------------------------------------------ 底栏
-    def _build_bottom(self) -> None:
+    # ------------------------------------------------------------ 底部：建造条
+    def _build_buildbar(self) -> None:
         P = scale.px
-        bar = tk.Frame(self, bg="#15181d", height=P(46))
+        bar = tk.Frame(self, bg="#15181d")
         bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-        self.btn_end = ttk.Button(bar, text="结束回合  ▶", command=self.end_turn,
-                                  style="Accent.TButton")
-        self.btn_end.pack(side="right", padx=P(10), pady=P(7))
-        self.lbl_hint = tk.Label(bar, text="选择建筑类型后点击地图建造；调好电价再结束回合",
-                                 bg="#15181d", fg=UI_DIM, font=(FONT, 9), anchor="w")
-        self.lbl_hint.pack(side="left", padx=P(12))
-        self.lbl_short = tk.Label(bar, text="", bg="#15181d", fg=UI_TEXT,
-                                  font=(FONT, 9), anchor="w")
-        self.lbl_short.pack(side="left")
+        tk.Frame(bar, bg="#d9534f", height=P(3)).pack(side="top", fill="x")
+        inner = tk.Frame(bar, bg="#15181d")
+        inner.pack(fill="x", padx=P(10), pady=P(5))
+
+        left = tk.Frame(inner, bg="#15181d")
+        left.pack(side="left")
+        tk.Label(left, text="建造", bg="#15181d", fg="#e8b4b0",
+                 font=(FONT, 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, P(4)))
+        self.build_buttons: dict[str, ttk.Button] = {}
+        items = [(k, PLANT_SPECS[k]) for k in PLANT_SPECS] + \
+                [(k, INFRA_SPECS[k]) for k in INFRA_SPECS]
+        for i, (kind, spec) in enumerate(items):
+            r, c = divmod(i, 6)
+            cost = spec.capex if kind in INFRA_SPECS else spec.capex_per_mw * spec.cap
+            b = ttk.Button(left, text=f"{spec.name} {money(cost)}", width=12,
+                           command=lambda k=kind: self.set_build(k))
+            b.grid(row=r, column=c + 1, padx=P(1), pady=P(1), sticky="ew")
+            self.build_buttons[kind] = b
+        ttk.Button(left, text="取消", command=self.cancel_build,
+                   style="Small.TButton").grid(row=0, column=7, padx=(P(6), 0), sticky="w")
+
+        right = tk.Frame(inner, bg="#15181d")
+        right.pack(side="right", fill="x", expand=True, padx=(P(12), 0))
+        self.lbl_hint = tk.Label(right, text="选择建造类型 → 点地图放置；Esc 取消",
+                                 bg="#15181d", fg=UI_DIM, font=(FONT, 9), anchor="e")
+        self.lbl_hint.pack(fill="x")
+        # 内联校验：钱不够/没地块的类型直接置灰，并说明原因
+        self.lbl_build_info = tk.Label(right, text="", bg="#15181d", fg=UI_DIM,
+                                       font=(FONT, 8), anchor="e", justify="right")
+        self.lbl_build_info.pack(fill="x")
 
     # ------------------------------------------------------------ 交互：地图
     def toast(self, msg: str, bad: bool = False, ms: int = 2600) -> None:
@@ -655,9 +988,11 @@ class App(tk.Tk):
 
     def do_issue(self) -> None:
         me = self.game.player
+        price0, cap0 = me.price, me.market_cap()
         try:
             cash = ma.issue_shares(self.game, me, me.shares * 0.06)
-            self.toast(f"增发募资 {money(cash)}")
+            self.toast(f"增发募资 {money(cash)}；股价 {price0:.2f}→{me.price:.2f}，"
+                       f"市值 {money(cap0)}→{money(me.market_cap())}")
         except MaError as e:
             self.toast(str(e), bad=True)
         self.refresh()
@@ -725,6 +1060,8 @@ class App(tk.Tk):
         self.map.build_mode = None
         self.game.end_turn()
         self.refresh()
+        if prefs.get("autosave"):
+            self.save_game(silent=True)
         self.after(30, self._after_turn)
 
     def _after_turn(self) -> None:
@@ -757,19 +1094,24 @@ class App(tk.Tk):
             "· 对手财报变差时股价会跌——那就是你低价收购的机会。\n\n"
             "详细规则见菜单【帮助 → 玩法与规则】。")
 
-    def save_game(self) -> None:
+    def save_game(self, silent: bool = False) -> None:
         import pickle
-        path = paths.save_file()
+        # 手动存档与自动存档分开：自动存档不能把玩家的手动存档冲掉
+        path = paths.save_file("autosave.pkl" if silent else "slot1.pkl")
         try:
             with open(path, "wb") as f:
                 pickle.dump(self.game, f)
-            self.toast(f"已保存到 {path}")
+            if not silent:
+                self.toast(f"已保存到 {path}")
         except Exception as e:  # noqa: BLE001
-            self.toast(f"保存失败：{e}", bad=True)
+            if not silent:
+                self.toast(f"保存失败：{e}", bad=True)
 
     def load_game(self) -> None:
         import pickle
         path = paths.save_file()
+        if not path.exists():
+            path = paths.save_file("autosave.pkl")
         if not path.exists():
             self.toast("没有找到存档", bad=True)
             return
@@ -804,12 +1146,14 @@ class App(tk.Tk):
         P = scale.px
 
         self.lbl_turn.config(text=g.turn_label())
+        self.lbl_season.config(text=f"{g.policy.stage()} · 需求 {g.total_demand():,.0f}MW")
         self.top_stats["cash"].config(text=money(me.cash))
         self.top_stats["debt"].config(text=money(me.debt))
-        pct = (me.price / me.price_prev - 1.0) * 100 if me.price_prev else 0.0
+        # 涨跌基准见 chg_pct()：动过价看本回合，没动看上一回合
+        pct = chg_pct(me)
         arrow = "▲ " if pct > 0.05 else ("▼ " if pct < -0.05 else "")
         self.top_stats["price"].config(
-            text=f"{arrow}{me.price:.2f}", fg=UI_GOOD if pct >= 0 else UI_BAD)
+            text=f"{arrow}{me.price:.2f}", fg=K_UP if pct >= 0 else K_DOWN)
         self.top_stats["cap"].config(text=money(me.market_cap()))
         self.top_stats["share"].config(text=f"{g.player_share():.1%}")
         self.top_stats["policy"].config(text=g.policy.stage())
@@ -959,19 +1303,16 @@ class App(tk.Tk):
         for co in g.companies:
             if not co.alive:
                 continue
-            chg = (co.price / co.price_prev - 1.0) * 100 if co.price_prev else 0.0
+            chg = chg_pct(co)
             my = player_stake(g, co)
-            np_ = co.profit_history[-1] if co.profit_history else 0.0
             state = "你的公司" if co.is_player else (
                 "已退市" if co.delisted else
                 ("已控股" if co.controlled_by == g.player_idx else "对手"))
             tv.insert("", "end", iid=str(co.idx), values=(
                 co.name, f"{co.price:.2f}", f"{chg:+.1f}%", money(co.market_cap()),
-                f"{my:.1%}", money(co.equity()), f"{co.debt_ratio():.0%}",
-                money(np_), state))
+                f"{my:.1%}", state))
         self.lbl_ceo.config(
-            text=f"CEO 个人账户：{money(g.ceo_cash)}（每季工资 220万 + 股利）    "
-                 f"公司现金：{money(g.player.cash)}")
+            text=f"CEO {money(g.ceo_cash)}  ·  公司现金 {money(g.player.cash)}")
         self.lb_subs.delete(0, "end")
         self._sub_keys = []
         for co in g.companies:
@@ -986,6 +1327,7 @@ class App(tk.Tk):
             self.lb_subs.itemconfig(0, foreground="#6f7784")
         self._refresh_intel()
         self.refresh_mkt_controls()
+        self.draw_kline()
 
     def refresh_mkt_controls(self) -> None:
         tgt = self._sel_company()
@@ -1023,11 +1365,11 @@ class App(tk.Tk):
             if co.controlled_by == g.player_idx:
                 risk.append("已被你控股")
             lines.append(
-                f"{co.name}　装机 {co.gen_capacity():.0f}MW　{mix_s}　"
-                f"电价 {co.res_price:.0f}/{co.ind_price:.0f}　负债率 {co.debt_ratio():.0%}\n"
-                f"　　现金 {money(co.cash)}　季度净利 {money(np_)}　"
-                f"股价/净资产 {pbr:.2f}x　可交付 {co.grid_capacity:.0f}MW　市占 {co.market_share:.0%}\n"
-                f"　　" + ("风险：" + "；".join(risk) if risk else "经营稳健"))
+                f"{co.name} {co.gen_capacity():.0f}MW 电价{co.res_price:.0f}/{co.ind_price:.0f} "
+                f"负债{co.debt_ratio():.0%} 净利{money(np_)} 市占{co.market_share:.0%} "
+                + ("⚠" + "/".join(risk) if risk else "稳健"))
+            if pbr < 0.85 or co.debt_ratio() > 0.55:
+                lines.append(f"　　可交付 {co.grid_capacity:.0f}MW · P/B {pbr:.2f}x · 现金 {money(co.cash)}")
         self.txt_intel.configure(state="normal")
         self.txt_intel.delete("1.0", "end")
         self.txt_intel.insert("1.0", "\n".join(lines) if lines else "暂无对手")
@@ -1075,11 +1417,6 @@ class App(tk.Tk):
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
 
-        self.log_list.delete(0, "end")
-        for line in lines[-40:]:
-            self.log_list.insert("end", line)
-        self.log_list.see("end")
-
 
 RULES = """《电力公司》玩法与规则
 ================================================
@@ -1089,11 +1426,11 @@ RULES = """《电力公司》玩法与规则
           → 财报决定股价 → 股价决定收购成本与风险 → 收购对手扩张
 
 二、每回合你要做的四件事
-  1. 看环境：需求、煤价/铀价、政策、对手财报与股价（政策·日志页）
-  2. 调资产：建电厂/变电站/线路/矿，招人或裁员，借款或还款（经营页）
-  3. 定电价：居民与工业分开定价（经营页）
-  4. 股市：买对手、回购自家、控股后抽血或合并（交易所页）
-  最后点【结束回合】。
+  1. 看环境：需求、煤价/铀价、政策、对手财报与股价（左侧【政策】）
+  2. 调资产：建电厂/变电站/线路/矿，招人或裁员，借款或还款（左侧【公司】→ 运营）
+  3. 定电价：居民与工业分开定价（左侧【公司】→ 运营）
+  4. 股市：买对手、回购自家、控股后抽血或合并（左侧【股市】）
+  最后点右上【结束回合】。
 
 三、必须理解的机制
   1. 固定成本照扣

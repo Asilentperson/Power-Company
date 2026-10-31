@@ -1,0 +1,123 @@
+name: release
+
+# 打 tag（v1.0.0 这种）→ 自动构建 Windows 发行包并发布 Release
+# 手动运行（Actions → release → Run workflow）→ 只构建并留 artifact，不发布
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-x64:
+    name: Windows x64 发行包
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+        with:
+          # pack_release.py 要把 git 提交号写进 MANIFEST，需要完整历史
+          fetch-depth: 0
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          # 与本地开发一致；setup-python 提供的 CPython 自带 tkinter/tcl-tk
+          # 若哪天 3.14 不可用，改成 "3.13" 即可（tcl/tk 同样自带）
+          python-version: "3.14"
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pillow
+
+      - name: 版本一致性检查（tag 与 constants.VERSION 必须一致）
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $src = Get-Content 'pwer/constants.py' -Raw -Encoding UTF8
+          $m = [regex]::Match($src, '^VERSION\s*=\s*"([^"]+)"', 'Multiline')
+          if (-not $m.Success) { throw 'pwer/constants.py 里没找到 VERSION' }
+          $ver = $m.Groups[1].Value
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          "tag=$tag  VERSION=$ver"
+          if ($ver -ne $tag) {
+            throw "标签 ${{ github.ref_name }} 与 VERSION=$ver 不一致，先改 constants.py 再打 tag"
+          }
+
+      - name: 打包（含产物自检门禁 + MANIFEST + zip）
+        shell: cmd
+        run: build.bat
+
+      - name: 回显产物自检结果
+        shell: pwsh
+        run: |
+          $log = 'dist/电力公司/selftest.log'
+          if (-not (Test-Path $log)) { throw '没有 selftest.log，自检可能没跑起来' }
+          Get-Content $log -Encoding UTF8
+          if (-not (Select-String -Path $log -Pattern '自检通过' -Quiet)) {
+            throw '产物自检没通过，不发布'
+          }
+
+      - name: 汇总
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem 'release/*.zip' | Select-Object -First 1
+          $sha = Get-FileHash $zip.FullName -Algorithm SHA256
+          $manifest = Get-Content 'dist/电力公司/MANIFEST.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+          @(
+            "### 发行包",
+            "",
+            "| 项 | 值 |",
+            "| --- | --- |",
+            "| 文件 | ``$($zip.Name)`` |",
+            "| 大小 | $('{0:N2}' -f ($zip.Length / 1MB)) MB |",
+            "| SHA-256 | ``$($sha.Hash.ToLower())`` |",
+            "| 版本 | v$($manifest.version) · BUILD $($manifest.build) |",
+            "| 源码 | $($manifest.gitRev)（dirty=$($manifest.gitDirty)） |",
+            "| 文件数 | $($manifest.fileCount) |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: pwer-windows-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            release/*.zip
+            release/*.sha256
+            dist/电力公司/MANIFEST.json
+            dist/电力公司/selftest.log
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "电力公司 ${{ github.ref_name }}"
+          files: |
+            release/*.zip
+            release/*.sha256
+          generate_release_notes: true
+          body: |
+            《电力公司》Windows x64 绿色版，解压即玩。
+
+            下载下面的 `电力公司-*-win64.zip`，解压后双击 `电力公司.exe`。
+
+            首次运行可能被 SmartScreen 拦一下：点「更多信息」→「仍要运行」，
+            或右键 exe → 属性 → 勾选「解除锁定」。原因是没有购买代码签名证书，
+            包内 `绿色小游戏告知.txt` 有详细说明。
+
+            校验：`电力公司-*-win64.zip.sha256` 里是 zip 的 SHA-256；
+            解压后目录里的 `MANIFEST.json` 记录了每个文件的哈希。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

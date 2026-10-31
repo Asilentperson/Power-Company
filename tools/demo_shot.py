@@ -52,13 +52,13 @@ def main() -> None:
         pass
     app.refresh()
     snap(app, "10_ops.png")
-    app.nb.select(app.tab_fin)
+    app.toggle_panel("company"); app.show_company_tab("fin")
     snap(app, "11_finance.png")
-    app.nb.select(app.tab_mkt)
+    app.toggle_panel("stock")
     app.tv_mkt.selection_set(str(tgt.idx))
     app.refresh_mkt_controls()
     snap(app, "12_market.png")
-    app.nb.select(app.tab_log)
+    app.toggle_panel("policy")
     snap(app, "13_log.png")
     g = app.game
     print(f"回合 {g.turn} 现金 {g.player.cash:,.0f} 份额 {g.player_share():.2%} "

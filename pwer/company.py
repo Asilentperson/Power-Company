@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -202,6 +203,11 @@ class Company:
     price: float = 12.0
     price_prev: float = 12.0
     price_history: list[float] = field(default_factory=list)
+    # 行情：每回合一根 K 线 (开, 高, 低, 收)。开盘=上回合收盘，影线来自本回合内的所有价格变动
+    candles: list[tuple[float, float, float, float]] = field(default_factory=list)
+    turn_open: float = 0.0
+    turn_high: float = 0.0
+    turn_low: float = 0.0
     fair_value: float = 12.0
     reputation: float = 60.0
     payout: float = 0.35
@@ -224,6 +230,54 @@ class Company:
     ai_alerted: bool = False
     banned_acq_turns: int = 0
     city_served: dict[int, tuple[float, float, float]] = field(default_factory=dict)
+
+    # ------------------------------------------------------------ 行情（K 线）
+    def note_price(self, p: float | None = None) -> None:
+        """记录本回合内的价格极值——K 线上下影线的唯一来源。"""
+        p = self.price if p is None else p
+        if self.turn_high <= 0:
+            self.turn_high = p
+        if self.turn_low <= 0:
+            self.turn_low = p
+        self.turn_high = max(self.turn_high, p)
+        self.turn_low = min(self.turn_low, p)
+
+    def open_candle(self) -> None:
+        """回合开始：以当前价为开盘价，重置本回合高低。"""
+        self.turn_open = self.price
+        self.turn_high = self.price
+        self.turn_low = self.price
+
+    def close_candle(self) -> None:
+        """回合结束：结算成一根 K 线。"""
+        self.note_price()
+        o = self.turn_open or self.price
+        hi = max(self.turn_high, o, self.price)
+        lo = min(self.turn_low or self.price, o, self.price)
+
+        # 影线：引擎每回合只结算一次价格，若不补影线，所有 K 线都会退化成"光头光脚"的柱子。
+        # 这里按本回合的实体幅度确定性地补一段上下影（不消耗随机数、不参与结算），
+        # 玩家买卖造成的真实冲击已经在 turn_high/turn_low 里，优先级更高。
+        body = abs(self.price - o)
+        if body > 1e-9:
+            r = random.Random(f"wick-{self.idx}-{o:.4f}-{self.price:.4f}")
+            hi = max(hi, max(o, self.price) + body * (0.10 + 0.45 * r.random()))
+            lo = min(lo, min(o, self.price) - body * (0.10 + 0.45 * r.random()))
+
+        self.candles.append((o, hi, lo, self.price))
+        if len(self.candles) > 40:
+            del self.candles[:-40]
+
+    def __setstate__(self, state) -> None:
+        """旧存档兼容：补齐后来才加的行情字段，避免读档后 AttributeError。"""
+        self.__dict__.update(state)
+        self.__dict__.setdefault("candles", [])
+        if getattr(self, "turn_open", 0.0) <= 0:
+            self.turn_open = self.price
+        if getattr(self, "turn_high", 0.0) <= 0:
+            self.turn_high = self.price
+        if getattr(self, "turn_low", 0.0) <= 0:
+            self.turn_low = self.price
 
     # ------------------------------------------------------------ 资产
     def assets(self) -> float:

@@ -64,16 +64,26 @@ def main() -> None:
     · 打开后做的事情只有一件：算数 + 在窗口里画格子地图
 
 
-五、你可以自己验证
+五、关于"源码"这件事（先说清楚，免得你翻包找不到）
+    发行包里**没有**可读的 .py 源文件。程序用 PyInstaller 打包，游戏代码
+    已经编译成 Python 字节码，和 Python 运行时一起封在 电力公司.exe 和
+    _internal\\ 里。这不是加密，也不是加壳，只是"不是源码"。
+    想看源码：https://github.com/Asilentperson/pwer_
+
+
+六、你可以自己验证
     1) 自检：命令行执行   电力公司.exe --selftest
        会依次检查 tkinter、游戏引擎、界面能否创建，全部通过会打印"自检通过"
     2) 杀毒扫描：右键 dist\\电力公司 文件夹 → 使用 Microsoft Defender 扫描
-       本项目所有文件都是明文 Python 脚本，没有加壳、没有混淆
-    3) 看源码：游戏源码在 pwer\\ 目录，入口是 main.py
-       嫌 exe 不放心的话，装个 Python 后直接  python main.py  效果完全一样
+       本项目是标准 PyInstaller 产物，没有加壳、没有混淆、没有第三方网络 SDK
+    3) 看源码 / 自己跑：源码在 https://github.com/Asilentperson/pwer_
+       装个 Python 3.10+（带 tkinter）后  python main.py  效果完全一样
+    4) 核对文件：程序目录里的 MANIFEST.json 记录了每个文件的 SHA-256，
+       PowerShell 执行  Get-FileHash .\\电力公司.exe -Algorithm SHA256
+       与 MANIFEST.json 里 电力公司.exe 那一行对比即可
 
 
-六、文件信息（可核对，防止被掉包）
+七、文件信息（可核对，防止被掉包）
     文件名    : 电力公司.exe
     大小      : {fmt_size(size)}
     构建时间  : {mtime}
@@ -82,7 +92,7 @@ def main() -> None:
     核对方法  : PowerShell 执行  Get-FileHash .\\电力公司.exe -Algorithm SHA256
 
 
-七、作者声明
+八、作者声明
     本程序是个人业余作品，不含任何恶意代码、广告、捆绑软件或后门。
     因为没买代码签名证书，Windows 会显示"未知发布者"，这属于正常现象。
     如果仍然不放心：删掉它、只跑源码，或者干脆别玩——完全没问题。

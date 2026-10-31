@@ -113,11 +113,11 @@ def main() -> None:
         traceback.print_exc()
         check("合并后继续回合", False)
 
-    # --- 7. 其它页签刷新
-    for tab in (app.tab_ops, app.tab_fin, app.tab_mkt, app.tab_log):
-        app.nb.select(tab)
+    # --- 7. 抽屉页签刷新
+    for key in ('policy', 'stock', 'company'):
+        app.toggle_panel(key)
         app.update()
-    check("四个页签刷新正常", True)
+    check("三个页签刷新正常", True)
 
     app.map.draw(g)
     app.update()

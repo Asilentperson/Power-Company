@@ -59,6 +59,17 @@ class MapView(ttk.Frame):
     def _motion(self, event) -> None:
         self.on_hover(self._tile_at(event.x, event.y))
 
+    # ------------------------------------------------------------ 尺寸
+    def set_tile(self, ts: int) -> None:
+        """按可用面积重算格子边长（App 在地图区尺寸变化时调用）。"""
+        global TS
+        TS = max(8, int(ts))
+        w = self.game.world.w if self.game is not None else 18
+        h = self.game.world.h if self.game is not None else 12
+        self.canvas.config(width=w * TS, height=h * TS)
+        if self.game is not None:
+            self.draw(self.game)
+
     # ------------------------------------------------------------ 绘制
     def draw(self, game) -> None:
         self.game = game

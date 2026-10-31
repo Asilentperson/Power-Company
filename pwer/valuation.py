@@ -61,6 +61,7 @@ def update_price(co: Company, rng: random.Random) -> None:
     drift = PRICE_SMOOTH * (fair - co.price)
     noise = rng.gauss(0.0, PRICE_NOISE) * max(1.0, co.price)
     co.price = max(MIN_PRICE, co.price + drift + noise)
+    co.note_price()                     # 记入本回合 K 线的高/低
     co.price_history.append(co.price)
     if len(co.price_history) > 40:
         co.price_history = co.price_history[-40:]
@@ -73,4 +74,5 @@ def update_all_prices(game) -> None:
             continue
         co.market_share = min(1.0, co.served_mw / total)
         update_price(co, game.rng)
+        co.close_candle()               # 收出本回合的 K 线
     # 子公司不再是独立上市公司，其价值体现在母公司的分红/股价上

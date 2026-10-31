@@ -107,6 +107,7 @@ def buy_shares(game, holder, target: Company, qty: float) -> float:
     hh[target.idx] = hh.get(target.idx, 0.0) + qty
     impact = SHARE_IMPACT * qty / max(1.0, target.shares)
     target.price *= 1.0 + impact * 0.5
+    target.note_price()            # 买入冲击计入本回合 K 线的上影
     if holder == game.player_idx or holder == CEO:
         prev = (hh.get(target.idx, 0.0) - qty) / max(1.0, target.shares)
         now = hh[target.idx] / max(1.0, target.shares)
@@ -133,6 +134,7 @@ def sell_shares(game, holder, target: Company, qty: float) -> float:
     hh[target.idx] = have - qty
     impact = SHARE_IMPACT * qty / max(1.0, target.shares)
     target.price = max(0.3, target.price * (1.0 - impact * 0.5))
+    target.note_price()            # 卖出冲击计入下影
     return proceeds
 
 
@@ -147,20 +149,38 @@ def buyback(game, co: Company, qty: float) -> float:
     co.cash -= cost
     co.shares -= qty
     co.price *= 1.0 + SHARE_IMPACT * qty / max(1.0, co.shares + qty) * 0.8
+    co.note_price()
     game.log(f"{co.name} 回购 {qty / max(1.0, co.shares + qty):.2%} 股本，耗资 {money(cost)}")
     return cost
 
 
-def issue_shares(game, co: Company, qty: float, discount: float = 0.06) -> float:
-    """增发：拿现金但稀释股权、压低股价。"""
+ISSUE_MAX_RATIO = 0.15       # 单次增发上限（占现有股本）
+ISSUE_DISCOUNT_BASE = 0.06   # 基础折价
+ISSUE_DISCOUNT_SLOPE = 0.80  # 每增发 1% 股本，折价再加 0.8%
+
+
+def issue_shares(game, co: Company, qty: float, discount: float | None = None) -> float:
+    """增发：折价配售。
+
+    拿现金、稀释股本，但市场会按配售价重估——股价直接跌到增发价，
+    而不是只吃一个 1% 的冲击系数。否则「股本 +6% / 股价 −1.5%」会让市值凭空变大，
+    增发就成了印钞机（市值还是胜利条件之一）。
+    """
     if qty <= 0:
         raise MaError("数量无效")
-    price = co.price * (1.0 - discount)
-    cash = price * qty
+    qty = min(qty, co.shares * ISSUE_MAX_RATIO)
+    ratio = qty / max(1.0, co.shares)
+    if discount is None:
+        # 发得越多、折价越深：6% 起步，最多 25%
+        discount = min(0.25, ISSUE_DISCOUNT_BASE + ISSUE_DISCOUNT_SLOPE * ratio)
+    issue_price = max(0.3, co.price * (1.0 - discount))
+    cash = issue_price * qty
     co.shares += qty
     co.cash += cash
-    co.price *= 1.0 - SHARE_IMPACT * qty / max(1.0, co.shares) * 0.9
-    game.log(f"{co.name} 增发 {qty:.0f} 万股，募资 {money(cash)}（股价被稀释）")
+    co.price = issue_price              # 市场按配售价重估（这才是"压低股价"）
+    co.note_price()
+    game.log(f"{co.name} 增发 {qty:.0f} 万股（占 {ratio:.1%}），募资 {money(cash)}，"
+             f"股价砸到 {co.price:.2f}（折价 {discount:.1%}）")
     return cash
 
 

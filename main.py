@@ -1,6 +1,6 @@
 """《电力公司》启动入口。
 
-    python main.py                 # 启动图形界面（tkinter，无第三方依赖）
+    python main.py                 # 启动图形界面：先进启动页，点【开始】进游戏
     python main.py --seed 2026     # 指定地图/随机种子
     python main.py --selftest      # 无窗口自检（打包后验证 exe 是否完整）
 """
@@ -84,17 +84,18 @@ def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
 
-    from pwer.ui.app import App
-
-    app = App()
+    seed = 20240501
     if "--seed" in sys.argv:
         try:
             seed = int(sys.argv[sys.argv.index("--seed") + 1])
-            from pwer.engine import Game
-            app.game = Game.new_game(seed)
-            app.refresh()
         except (IndexError, ValueError):
             pass
+
+    from pwer.ui.app import App
+
+    # 单窗口：启动页是盖在游戏窗口上的覆盖层，点【开始】只是把它摘掉，
+    # 不会再销毁窗口重新开一个（那样会闪一下，全屏下尤其明显）。
+    app = App(show_start=True, seed=seed)
     app.mainloop()
     return 0
 

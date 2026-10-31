@@ -158,6 +158,7 @@ class Game:
             co.price = 12.0
             co.price_prev = 12.0
             co.price_history = [12.0]
+            co.open_candle()
 
     def _starter_site(self, co: Company, city: City, kinds: tuple[str, ...]) -> None:
         """给一家公司在城市附近配好"电厂 + 变电站 + 输电线"。"""
@@ -517,6 +518,7 @@ class Game:
             city.base_mw *= 1.0 + city.growth
         self._walk_market()
         for co in self.companies:
+            co.open_candle()             # 新回合：以上回合收盘价为开盘价
             for p in co.plants:
                 if not p.online:
                     p.outage_turns -= 1
