@@ -83,6 +83,15 @@ class MapView(ttk.Frame):
                     c.create_oval(x0 + ts * 0.82 - r, y0 + ts * 0.82 - r,
                                   x0 + ts * 0.82 + r, y0 + ts * 0.82 + r,
                                   fill="#3fae5a", outline="#000")
+        # 建造模式：只压暗地面（不可建的地块），建筑与城市仍保持清晰
+        if self.build_mode:
+            for row in w.tiles:
+                for t in row:
+                    if (t.x, t.y) in self.valid_tiles:
+                        continue
+                    c.create_rectangle(t.x * ts + 1, t.y * ts + 1,
+                                       t.x * ts + ts - 1, t.y * ts + ts - 1,
+                                       fill="#0c0e12", outline="", stipple="gray50")
         # 输电线路：先画在地块之上、建筑之下
         for row in w.tiles:
             for t in row:
@@ -108,12 +117,6 @@ class MapView(ttk.Frame):
         for row in w.tiles:
             for t in row:
                 self._draw_occupant(game, t)
-        if self.build_mode:
-            for (x, y) in self.valid_tiles:
-                c.create_rectangle(x * ts + 1, y * ts + 1,
-                                   x * ts + ts - 1, y * ts + ts - 1,
-                                   outline="#7df59a", width=2, stipple="gray50",
-                                   fill="#2f8f4a")
         if self.selected:
             x, y = self.selected
             c.create_rectangle(x * ts, y * ts, x * ts + ts, y * ts + ts,

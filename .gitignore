@@ -28,3 +28,11 @@ tmpbuild/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- 其他 ----
+绿色小游戏告知.txt
+ddd.txt
+
+# ---- 工具 ----
+tools/
+*.py

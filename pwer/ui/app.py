@@ -59,6 +59,8 @@ class App(tk.Tk):
         self.build_mode: str | None = None
         self.selected: tuple[int, int] | None = None
         self._syncing = False
+        self._toast_job = None
+        self._log_rendered = 0
         self._style()
         self._menu()
         self._build_top()
@@ -67,10 +69,16 @@ class App(tk.Tk):
         self._build_left(body)
         self._build_right(body)
         self._build_bottom()
-        self.bind("<Control-Return>", lambda e: self.end_turn())
+        self._bind_keys()
         self.refresh()
         if not os.environ.get("PWER_NO_INTRO"):
             self.after(200, self._intro)
+
+    def _bind_keys(self) -> None:
+        self.bind("<Control-Return>", lambda e: self.end_turn())
+        self.bind("<Escape>", lambda e: self.cancel_build() if self.build_mode else None)
+        for i, tab in enumerate((self.tab_ops, self.tab_fin, self.tab_mkt, self.tab_log), 1):
+            self.bind(f"<Control-Key-{i}>", lambda e, t=tab: self.nb.select(t))
 
     # ------------------------------------------------------------ 样式
     def _style(self) -> None:
@@ -258,6 +266,7 @@ class App(tk.Tk):
                         ("cost", "已投", 90)):
             self.tv_projects.heading(c, text=t)
             self.tv_projects.column(c, width=P(w), anchor="center")
+        self.tv_projects.tag_configure("empty", foreground="#6f7784")
         self.tv_projects.pack(fill="x", pady=(P(3), 0))
 
         box = tk.Frame(root, bg=UI_PANEL)
@@ -282,6 +291,10 @@ class App(tk.Tk):
             self.build_buttons[kind] = b
         for c in range(4):
             grid.columnconfigure(c, weight=1)
+        # 内联校验：钱不够/没地块的类型直接置灰，并说明原因（不让玩家点了才报错）
+        self.lbl_build_info = tk.Label(box, text="", bg=UI_PANEL, fg=UI_DIM,
+                                       font=(FONT, 8), anchor="w", justify="left")
+        self.lbl_build_info.pack(fill="x", pady=(P(2), 0))
 
         box = tk.Frame(root, bg=UI_PANEL)
         box.pack(fill="x", padx=P(8), pady=(P(4), P(8)))
@@ -444,6 +457,29 @@ class App(tk.Tk):
         self.lbl_short.pack(side="left")
 
     # ------------------------------------------------------------ 交互：地图
+    def toast(self, msg: str, bad: bool = False, ms: int = 2600) -> None:
+        """就近反馈：底部状态条显示 2.6 秒后自动回到当前提示。"""
+        self.lbl_hint.config(text=("✕ " if bad else "✓ ") + msg,
+                             fg=UI_BAD if bad else UI_GOOD)
+        if self._toast_job is not None:
+            try:
+                self.after_cancel(self._toast_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._toast_job = self.after(ms, self._restore_hint)
+
+    def _restore_hint(self) -> None:
+        self._toast_job = None
+        self.lbl_hint.config(text=self._idle_hint(), fg=UI_DIM)
+
+    def _idle_hint(self) -> str:
+        if self.build_mode:
+            name = (PLANT_SPECS[self.build_mode].name if self.build_mode in PLANT_SPECS
+                    else INFRA_SPECS[self.build_mode].name)
+            n = len(self.map.valid_tiles)
+            return f"建造模式：{name} · 可建 {n} 处（其余地块已变暗）· 点击地图确认，Esc 退出"
+        return "选择建筑类型后点击地图建造；调好电价再结束回合"
+
     def on_tile_click(self, x: int, y: int) -> None:
         self.selected = (x, y)
         me = self.game.player
@@ -454,7 +490,7 @@ class App(tk.Tk):
                 self.map.draw(self.game)
                 self.refresh()
                 return
-            self.flash(f"无法建造：{why}", bad=True)
+            self.toast(f"无法建造：{why}", bad=True)
             self.map.draw(self.game)
             return
         self.update_tile_label()
@@ -489,26 +525,21 @@ class App(tk.Tk):
         self.map.build_mode = kind
         self.map.valid_tiles = valid
         self.map.draw(self.game)
-        name = PLANT_SPECS[kind].name if kind in PLANT_SPECS else INFRA_SPECS[kind].name
-        self.lbl_hint.config(
-            text=f"建造模式：{name} · 绿色地块可建（{len(valid)} 处）· 点击地图确认", fg=UI_GOOD)
+        self._restore_hint()
 
     def cancel_build(self) -> None:
         self.build_mode = None
         self.map.build_mode = None
         self.map.valid_tiles = set()
         self.map.draw(self.game)
-        self.lbl_hint.config(text="已退出建造模式", fg=UI_DIM)
-
-    def flash(self, msg: str, bad: bool = False) -> None:
-        self.lbl_hint.config(text=msg, fg=UI_BAD if bad else UI_GOOD)
+        self.lbl_hint.config(text=self._idle_hint(), fg=UI_DIM)
 
     # ------------------------------------------------------------ 交互：按钮
     def do_borrow(self, amount: float) -> None:
         try:
             self.game.borrow(self.game.player, amount)
         except ValueError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_borrow_max(self) -> None:
@@ -519,21 +550,21 @@ class App(tk.Tk):
         try:
             self.game.repay(self.game.player, amount)
         except ValueError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_hire(self, ops: int, eng: int) -> None:
         try:
             self.game.hire(self.game.player, ops, eng)
         except ValueError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_fire(self, ops: int, eng: int) -> None:
         try:
             self.game.fire(self.game.player, ops, eng)
         except ValueError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def on_price_change(self) -> None:
@@ -584,34 +615,34 @@ class App(tk.Tk):
     def do_buy(self, company_fund: bool) -> None:
         tgt = self._sel_company()
         if not tgt:
-            self.flash("先在表格里选中一家公司", bad=True)
+            self.toast("先在表格里选中一家公司", bad=True)
             return
         me = self.game.player
         if tgt.idx == me.idx:
-            self.flash("买自家股票请用【回购自家】", bad=True)
+            self.toast("买自家股票请用【回购自家】", bad=True)
             return
         holder = me.idx if company_fund else "CEO"
         try:
             qty = self._qty(tgt)
             cost = ma.buy_cost(tgt, qty)
             ma.buy_shares(self.game, holder, tgt, qty)
-            self.flash(f"买入 {tgt.name} {qty:,.0f}万股，花费 {money(cost)}")
+            self.toast(f"买入 {tgt.name} {qty:,.0f}万股，花费 {money(cost)}")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_sell(self) -> None:
         tgt = self._sel_company()
         if not tgt:
-            self.flash("先选中一家公司", bad=True)
+            self.toast("先选中一家公司", bad=True)
             return
         me = self.game.player
         holder = me.idx if me.holdings.get(tgt.idx, 0) >= self.game.ceo_holdings.get(tgt.idx, 0) else "CEO"
         try:
             got = ma.sell_shares(self.game, holder, tgt, tgt.shares * 0.5)
-            self.flash(f"卖出套现 {money(got)}")
+            self.toast(f"卖出套现 {money(got)}")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_buyback(self) -> None:
@@ -619,16 +650,16 @@ class App(tk.Tk):
         try:
             ma.buyback(self.game, me, me.shares * 0.02)
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_issue(self) -> None:
         me = self.game.player
         try:
             cash = ma.issue_shares(self.game, me, me.shares * 0.06)
-            self.flash(f"增发募资 {money(cash)}")
+            self.toast(f"增发募资 {money(cash)}")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_take_control(self) -> None:
@@ -637,9 +668,9 @@ class App(tk.Tk):
             return
         try:
             ma.take_control(self.game, tgt)
-            self.flash(f"已控股 {tgt.name}")
+            self.toast(f"已控股 {tgt.name}")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_merge(self) -> None:
@@ -652,9 +683,9 @@ class App(tk.Tk):
             return
         try:
             ma.absorb_merge(self.game, tgt)
-            self.flash(f"{tgt.name} 已并入你的集团")
+            self.toast(f"{tgt.name} 已并入你的集团")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_sweep(self) -> None:
@@ -663,27 +694,27 @@ class App(tk.Tk):
             return
         try:
             ma.force_dividend(self.game, tgt)
-            self.flash(f"{tgt.name} 已改为全额分红")
+            self.toast(f"{tgt.name} 已改为全额分红")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     def do_retire(self) -> None:
         sel = self.lb_subs.curselection()
         if not sel:
-            self.flash("先选中要淘汰的机组", bad=True)
+            self.toast("先选中要淘汰的机组", bad=True)
             return
         try:
             key = self._sub_keys[sel[0]]
             idx, plant_id = (int(v) for v in key.split("|"))
         except (ValueError, IndexError):
-            self.flash("无法解析机组", bad=True)
+            self.toast("无法解析机组", bad=True)
             return
         try:
             ma.retire_plant(self.game, self.game.companies[idx], plant_id, by_player=True)
-            self.flash("机组已淘汰，固定成本下降")
+            self.toast("机组已淘汰，固定成本下降")
         except MaError as e:
-            self.flash(str(e), bad=True)
+            self.toast(str(e), bad=True)
         self.refresh()
 
     # ------------------------------------------------------------ 回合
@@ -732,15 +763,15 @@ class App(tk.Tk):
         try:
             with open(path, "wb") as f:
                 pickle.dump(self.game, f)
-            self.flash(f"已保存到 {path}")
+            self.toast(f"已保存到 {path}")
         except Exception as e:  # noqa: BLE001
-            self.flash(f"保存失败：{e}", bad=True)
+            self.toast(f"保存失败：{e}", bad=True)
 
     def load_game(self) -> None:
         import pickle
         path = paths.save_file()
         if not path.exists():
-            self.flash("没有找到存档", bad=True)
+            self.toast("没有找到存档", bad=True)
             return
         try:
             with open(path, "rb") as f:
@@ -750,9 +781,9 @@ class App(tk.Tk):
             self.map.valid_tiles = set()
             self.selected = None
             self.refresh()
-            self.flash(f"读取成功：{path}")
+            self.toast(f"读取成功：{path}")
         except Exception as e:  # noqa: BLE001
-            self.flash(f"读取失败：{e}", bad=True)
+            self.toast(f"读取失败：{e}", bad=True)
 
     def show_rules(self) -> None:
         win = tk.Toplevel(self)
@@ -776,8 +807,9 @@ class App(tk.Tk):
         self.top_stats["cash"].config(text=money(me.cash))
         self.top_stats["debt"].config(text=money(me.debt))
         pct = (me.price / me.price_prev - 1.0) * 100 if me.price_prev else 0.0
+        arrow = "▲ " if pct > 0.05 else ("▼ " if pct < -0.05 else "")
         self.top_stats["price"].config(
-            text=f"{me.price:.2f}", fg=UI_GOOD if pct >= 0 else UI_BAD)
+            text=f"{arrow}{me.price:.2f}", fg=UI_GOOD if pct >= 0 else UI_BAD)
         self.top_stats["cap"].config(text=money(me.market_cap()))
         self.top_stats["share"].config(text=f"{g.player_share():.1%}")
         self.top_stats["policy"].config(text=g.policy.stage())
@@ -797,16 +829,24 @@ class App(tk.Tk):
                                      f"/配额 {g.policy.renewable_quota:.0%}")
         self.update_cost_label()
 
+        st = me.last_income
         tv = self.tv_plants
         tv.delete(*tv.get_children())
+        short = me.staff_ratio() < 0.99
         for p in me.plants:
-            status = "停机" if not p.online else (
-                "缺人降效" if me.staff_ratio() < 0.99 else "运行")
+            if not p.online:
+                status = "停机检修"
+            elif short:
+                status = f"缺人 · 出力×{max(0.55, me.staff_ratio()):.0%}"
+            else:
+                status = "运行"
             tv.insert("", "end", values=(
                 p.name, f"{p.cap:.0f}MW", f"{p.cf_actual:.0%}",
                 f"{p.fixed_q:,.0f}万", f"{p.dispatched_mwh:,.0f}", status))
         tp = self.tv_projects
         tp.delete(*tp.get_children())
+        if not me.projects:
+            tp.insert("", "end", values=("暂无在建工程", "—", "—"), tags=("empty",))
         for pr in me.projects:
             tp.insert("", "end", values=(pr.name, f"{pr.turns_left} 回合", f"{pr.spent:,.0f}万"))
 
@@ -849,7 +889,47 @@ class App(tk.Tk):
             self.update_tile_label()
 
         self._syncing = False
+        self._sync_build_buttons()
         self.btn_end.config(state="disabled" if g.game_over else "normal")
+
+    def _kind_cost(self, kind: str) -> float:
+        """按钮上标注的基础造价（未含地形乘数，用作可负担性判断的下界）。"""
+        if kind in PLANT_SPECS:
+            spec = PLANT_SPECS[kind]
+            return spec.capex_per_mw * spec.cap
+        return INFRA_SPECS[kind].capex
+
+    def _sync_build_buttons(self) -> None:
+        """内联校验：不可行的建造类型直接置灰，并在下方说明原因。"""
+        me = self.game.player
+        ready = 0
+        missing: dict[str, list[str]] = {}
+        for kind, btn in self.build_buttons.items():
+            cost = self._kind_cost(kind)
+            name = (PLANT_SPECS[kind].name if kind in PLANT_SPECS
+                    else INFRA_SPECS[kind].name)
+            tiles = sum(1 for t in self.game.world.iter_tiles()
+                        if self.game.world.check_build(kind, t.x, t.y)[0])
+            approved = (kind != "nuclear") or self.game.policy.nuclear_approved
+            can_pay = me.cash >= cost * 1.05
+            ok = tiles > 0 and can_pay and approved
+            btn.state(["!disabled"] if ok else ["disabled"])
+            if ok:
+                ready += 1
+            elif not approved:
+                missing.setdefault("核电待核准", []).append(name)
+            elif tiles == 0:
+                missing.setdefault("无地可建", []).append(name)
+            else:
+                missing.setdefault(f"缺 {money(cost - me.cash)}", []).append(name)
+        if ready == len(self.build_buttons):
+            text, color = f"当前 {ready}/{len(self.build_buttons)} 类可开工", UI_DIM
+        else:
+            parts = [f"{k}：{'/'.join(v)}" for k, v in missing.items()]
+            text = (f"当前可开工 {ready}/{len(self.build_buttons)} · "
+                    + "；".join(parts[:2]) + (f" 等 {len(parts)} 项" if len(parts) > 2 else ""))
+            color = UI_WARN
+        self.lbl_build_info.config(text=text, fg=color)
 
     def _next_policy_text(self) -> str:
         g = self.game
@@ -901,6 +981,9 @@ class App(tk.Tk):
                 self.lb_subs.insert("end", f"{co.name} · {p.name} {p.cap:.0f}MW "
                                            f"固定 {p.fixed_q:,.0f}万/季 [{p.id}]")
                 self._sub_keys.append(f"{co.idx}|{p.id}")
+        if not self._sub_keys:
+            self.lb_subs.insert("end", "尚未控股任何公司（持股 51% 后可在此处置其机组）")
+            self.lb_subs.itemconfig(0, foreground="#6f7784")
         self._refresh_intel()
         self.refresh_mkt_controls()
 
@@ -977,15 +1060,25 @@ class App(tk.Tk):
                           fill=UI_GOOD if v >= 0 else UI_BAD, outline="")
 
     def _refresh_log(self) -> None:
-        self.log_list.delete(0, "end")
-        for line in self.game.log_lines[-40:]:
-            self.log_list.insert("end", line)
-        self.log_list.see("end")
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", "end")
-        self.txt_log.insert("1.0", "\n".join(self.game.log_lines))
+        """增量渲染日志：只追加新行，避免每次刷新重贴几百行（这是最容易被忽略的卡顿源）。"""
+        lines = self.game.log_lines
+        if len(lines) < self._log_rendered or self._log_rendered == 0:
+            self.txt_log.configure(state="normal")
+            self.txt_log.delete("1.0", "end")
+            self.txt_log.insert("1.0", "\n".join(lines))
+            self._log_rendered = len(lines)
+        elif len(lines) > self._log_rendered:
+            self.txt_log.configure(state="normal")
+            for line in lines[self._log_rendered:]:
+                self.txt_log.insert("end", "\n" + line)
+            self._log_rendered = len(lines)
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
+
+        self.log_list.delete(0, "end")
+        for line in lines[-40:]:
+            self.log_list.insert("end", line)
+        self.log_list.see("end")
 
 
 RULES = """《电力公司》玩法与规则
